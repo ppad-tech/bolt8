@@ -1,5 +1,6 @@
 {-# OPTIONS_HADDOCK prune #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -35,6 +36,7 @@ module Lightning.Protocol.BOLT8 (
 
     -- * Session
   , Session
+  , HandshakeState
   , HandshakeResult(..)
   , encrypt_message
   , decrypt_message
@@ -51,12 +53,13 @@ import qualified Crypto.KDF.HMAC as HKDF
 import Data.Bits (unsafeShiftR, (.&.))
 import qualified Data.ByteString as BS
 import Data.Word (Word16, Word64)
+import GHC.Generics (Generic)
 
 -- types ---------------------------------------------------------------------
 
 -- | Secret key (32 bytes).
 newtype Sec = Sec BS.ByteString
-  deriving Eq
+  deriving (Eq, Generic)
 
 -- | Compressed public key.
 newtype Pub = Pub Secp256k1.Projective
@@ -76,7 +79,7 @@ data Error =
   | InvalidVersion
   | InvalidLength
   | DecryptionFailed
-  deriving (Eq, Show)
+  deriving (Eq, Show, Generic)
 
 -- | Post-handshake session state.
 data Session = Session {
@@ -87,14 +90,16 @@ data Session = Session {
   , sess_rn  :: {-# UNPACK #-} !Word64         -- ^ receive nonce
   , sess_rck :: {-# UNPACK #-} !BS.ByteString  -- ^ receive chaining key
   }
+  deriving Generic
 
 -- | Result of a successful handshake.
 data HandshakeResult = HandshakeResult {
     hr_session   :: !Session      -- ^ session state
   , hr_remote_pk :: !Pub          -- ^ authenticated remote static pubkey
   }
+  deriving Generic
 
--- internal handshake state
+-- | Internal handshake state (exported for benchmarking).
 data HandshakeState = HandshakeState {
     hs_h      :: {-# UNPACK #-} !BS.ByteString  -- handshake hash (32 bytes)
   , hs_ck     :: {-# UNPACK #-} !BS.ByteString  -- chaining key (32 bytes)
@@ -106,6 +111,7 @@ data HandshakeState = HandshakeState {
   , hs_re     :: !(Maybe Pub)                   -- remote ephemeral
   , hs_rs     :: !(Maybe Pub)                   -- remote static
   }
+  deriving Generic
 
 -- protocol constants --------------------------------------------------------
 
