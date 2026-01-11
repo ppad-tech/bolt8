@@ -8,6 +8,12 @@
       ref  = "master";
       inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
     };
+    ppad-base16 = {
+      type = "git";
+      url  = "git://git.ppad.tech/base16.git";
+      ref  = "master";
+      inputs.ppad-nixpkgs.follows = "ppad-nixpkgs";
+    };
     ppad-hkdf = {
       # XX temporarily using github mirror
       type = "github";
@@ -42,7 +48,7 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, ppad-nixpkgs
-            , ppad-aead, ppad-hkdf, ppad-secp256k1, ppad-sha256
+            , ppad-aead, ppad-base16, ppad-hkdf, ppad-secp256k1, ppad-sha256
             }:
     flake-utils.lib.eachDefaultSystem (system:
       let
@@ -57,6 +63,12 @@
         aead-llvm =
           hlib.addBuildTools
             (hlib.enableCabalFlag aead "llvm")
+            [ llvm clang ];
+
+        base16 = ppad-base16.packages.${system}.default;
+        base16-llvm =
+          hlib.addBuildTools
+            (hlib.enableCabalFlag base16 "llvm")
             [ llvm clang ];
 
         hkdf = ppad-hkdf.packages.${system}.default;
@@ -79,11 +91,13 @@
 
         hpkgs = pkgs.haskell.packages.ghc910.extend (new: old: {
           ppad-aead = aead-llvm;
+          ppad-base16 = base16-llvm;
           ppad-hkdf = hkdf-llvm;
           ppad-secp256k1 = secp256k1-llvm;
           ppad-sha256 = sha256-llvm;
           ${lib} = new.callCabal2nix lib ./. {
             ppad-aead = new.ppad-aead;
+            ppad-base16 = new.ppad-base16;
             ppad-hkdf = new.ppad-hkdf;
             ppad-secp256k1 = new.ppad-secp256k1;
             ppad-sha256 = new.ppad-sha256;

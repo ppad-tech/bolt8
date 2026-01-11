@@ -105,6 +105,37 @@
     "ppad-base16_2": {
       "inputs": {
         "flake-utils": [
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "ppad-base16",
+          "ppad-nixpkgs",
+          "nixpkgs"
+        ],
+        "ppad-nixpkgs": [
+          "ppad-nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1766934151,
+        "narHash": "sha256-BUFpuLfrGXE2xi3Wa9TYCEhhRhFp175Ghxnr0JRbG2I=",
+        "ref": "master",
+        "rev": "58dfb7922401a60d5de76825fcd5f6ecbcd7afe0",
+        "revCount": 26,
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "git://git.ppad.tech/base16.git"
+      }
+    },
+    "ppad-base16_3": {
+      "inputs": {
+        "flake-utils": [
           "ppad-hkdf",
           "ppad-base16",
           "ppad-nixpkgs",
@@ -136,7 +167,7 @@
         "url": "git://git.ppad.tech/base16.git"
       }
     },
-    "ppad-base16_3": {
+    "ppad-base16_4": {
       "inputs": {
         "flake-utils": [
           "ppad-secp256k1",
@@ -170,7 +201,7 @@
         "url": "git://git.ppad.tech/base16.git"
       }
     },
-    "ppad-base16_4": {
+    "ppad-base16_5": {
       "inputs": {
         "flake-utils": [
           "ppad-sha256",
@@ -325,7 +356,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16_2",
+        "ppad-base16": "ppad-base16_3",
         "ppad-nixpkgs": [
           "ppad-nixpkgs"
         ],
@@ -465,7 +496,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16_3",
+        "ppad-base16": "ppad-base16_4",
         "ppad-fixed": "ppad-fixed_2",
         "ppad-hmac-drbg": "ppad-hmac-drbg",
         "ppad-nixpkgs": [
@@ -503,7 +534,7 @@
           "ppad-nixpkgs",
           "nixpkgs"
         ],
-        "ppad-base16": "ppad-base16_4",
+        "ppad-base16": "ppad-base16_5",
         "ppad-nixpkgs": [
           "ppad-nixpkgs"
         ]
@@ -610,6 +641,7 @@
           "nixpkgs"
         ],
         "ppad-aead": "ppad-aead",
+        "ppad-base16": "ppad-base16_2",
         "ppad-hkdf": "ppad-hkdf",
         "ppad-nixpkgs": "ppad-nixpkgs",
         "ppad-secp256k1": "ppad-secp256k1",
