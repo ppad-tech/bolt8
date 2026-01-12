@@ -16,7 +16,7 @@ instance NFData BOLT8.Sec
 instance NFData BOLT8.Error
 instance NFData BOLT8.Session
 instance NFData BOLT8.HandshakeState
-instance NFData BOLT8.HandshakeResult
+instance NFData BOLT8.Handshake
 
 -- note that 'weigh' doesn't work properly in a repl
 main :: IO ()
@@ -45,37 +45,31 @@ handshake :: Weigh ()
 handshake =
   let Just (!i_s_sec, !i_s_pub) = BOLT8.keypair i_s_ent
       Just (!r_s_sec, !r_s_pub) = BOLT8.keypair r_s_ent
-      Right (!act1, !i_hs) =
-        BOLT8.initiator_act1 i_s_sec i_s_pub r_s_pub i_e_ent
-      Right (!act2, !r_hs) =
-        BOLT8.responder_act2 r_s_sec r_s_pub r_e_ent act1
-      Right (!act3, _) = BOLT8.initiator_act3 i_hs act2
+      Right (!msg1, !i_hs) = BOLT8.act1 i_s_sec i_s_pub r_s_pub i_e_ent
+      Right (!msg2, !r_hs) = BOLT8.act2 r_s_sec r_s_pub r_e_ent msg1
+      Right (!msg3, _) = BOLT8.act3 i_hs msg2
   in  wgroup "handshake" $ do
-        func "initiator_act1"
-          (BOLT8.initiator_act1 i_s_sec i_s_pub r_s_pub) i_e_ent
-        func "responder_act2"
-          (BOLT8.responder_act2 r_s_sec r_s_pub r_e_ent) act1
-        func "initiator_act3" (BOLT8.initiator_act3 i_hs) act2
-        func "responder_finalize" (BOLT8.responder_finalize r_hs) act3
+        func "act1" (BOLT8.act1 i_s_sec i_s_pub r_s_pub) i_e_ent
+        func "act2" (BOLT8.act2 r_s_sec r_s_pub r_e_ent) msg1
+        func "act3" (BOLT8.act3 i_hs) msg2
+        func "finalize" (BOLT8.finalize r_hs) msg3
 
 messages :: Weigh ()
 messages =
   let Just (!i_s_sec, !i_s_pub) = BOLT8.keypair i_s_ent
       Just (!r_s_sec, !r_s_pub) = BOLT8.keypair r_s_ent
-      Right (act1, i_hs) =
-        BOLT8.initiator_act1 i_s_sec i_s_pub r_s_pub i_e_ent
-      Right (act2, r_hs) =
-        BOLT8.responder_act2 r_s_sec r_s_pub r_e_ent act1
-      Right (act3, i_result) = BOLT8.initiator_act3 i_hs act2
-      Right r_result = BOLT8.responder_finalize r_hs act3
-      !i_sess = BOLT8.hr_session i_result
-      !r_sess = BOLT8.hr_session r_result
+      Right (msg1, i_hs) = BOLT8.act1 i_s_sec i_s_pub r_s_pub i_e_ent
+      Right (msg2, r_hs) = BOLT8.act2 r_s_sec r_s_pub r_e_ent msg1
+      Right (msg3, i_result) = BOLT8.act3 i_hs msg2
+      Right r_result = BOLT8.finalize r_hs msg3
+      !i_sess = BOLT8.session i_result
+      !r_sess = BOLT8.session r_result
       !small_msg = BS.replicate 32 0x00
       !large_msg = BS.replicate 1024 0x00
-      Right (!ct_small, _) = BOLT8.encrypt_message i_sess small_msg
-      Right (!ct_large, _) = BOLT8.encrypt_message i_sess large_msg
+      Right (!ct_small, _) = BOLT8.encrypt i_sess small_msg
+      Right (!ct_large, _) = BOLT8.encrypt i_sess large_msg
   in  wgroup "messages" $ do
-        func "encrypt (32B)" (BOLT8.encrypt_message i_sess) small_msg
-        func "encrypt (1KB)" (BOLT8.encrypt_message i_sess) large_msg
-        func "decrypt (32B)" (BOLT8.decrypt_message r_sess) ct_small
-        func "decrypt (1KB)" (BOLT8.decrypt_message r_sess) ct_large
+        func "encrypt (32B)" (BOLT8.encrypt i_sess) small_msg
+        func "encrypt (1KB)" (BOLT8.encrypt i_sess) large_msg
+        func "decrypt (32B)" (BOLT8.decrypt r_sess) ct_small
+        func "decrypt (1KB)" (BOLT8.decrypt r_sess) ct_large

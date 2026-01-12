@@ -27,19 +27,19 @@ module Lightning.Protocol.BOLT8 (
   , serialize_pub
 
     -- * Handshake (initiator)
-  , initiator_act1
-  , initiator_act3
+  , act1
+  , act3
 
     -- * Handshake (responder)
-  , responder_act2
-  , responder_finalize
+  , act2
+  , finalize
 
     -- * Session
   , Session
   , HandshakeState
-  , HandshakeResult(..)
-  , encrypt_message
-  , decrypt_message
+  , Handshake(..)
+  , encrypt
+  , decrypt
 
     -- * Errors
   , Error(..)
@@ -93,9 +93,9 @@ data Session = Session {
   deriving Generic
 
 -- | Result of a successful handshake.
-data HandshakeResult = HandshakeResult {
-    hr_session   :: !Session      -- ^ session state
-  , hr_remote_pk :: !Pub          -- ^ authenticated remote static pubkey
+data Handshake = Handshake {
+    session       :: !Session  -- ^ session state
+  , remote_static :: !Pub      -- ^ authenticated remote static pubkey
   }
   deriving Generic
 
@@ -288,15 +288,15 @@ init_handshake s_sec s_pub e_sec e_pub m_rs is_initiator =
 --   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
 --   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
 --   >>> let eph_ent = BS.replicate 32 0x12
---   >>> case initiator_act1 i_sec i_pub r_pub eph_ent of { Right (msg, _) -> BS.length msg; Left _ -> 0 }
+--   >>> case act1 i_sec i_pub r_pub eph_ent of { Right (msg, _) -> BS.length msg; Left _ -> 0 }
 --   50
-initiator_act1
+act1
   :: Sec                -- ^ local static secret
   -> Pub                -- ^ local static public
   -> Pub                -- ^ remote static public (responder's)
   -> BS.ByteString      -- ^ 32 bytes entropy for ephemeral
   -> Either Error (BS.ByteString, HandshakeState)
-initiator_act1 s_sec s_pub rs ent = do
+act1 s_sec s_pub rs ent = do
   (e_sec, e_pub) <- note InvalidKey (keypair ent)
   let !hs0 = init_handshake s_sec s_pub e_sec e_pub (Just rs) True
       !e_pub_bytes = serialize_pub e_pub
@@ -322,20 +322,20 @@ initiator_act1 s_sec s_pub rs ent = do
 --
 --   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
 --   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
---   >>> let Right (act1, _) = initiator_act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
---   >>> case responder_act2 r_sec r_pub (BS.replicate 32 0x22) act1 of { Right (msg, _) -> BS.length msg; Left _ -> 0 }
+--   >>> let Right (msg1, _) = act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
+--   >>> case act2 r_sec r_pub (BS.replicate 32 0x22) msg1 of { Right (msg, _) -> BS.length msg; Left _ -> 0 }
 --   50
-responder_act2
+act2
   :: Sec                -- ^ local static secret
   -> Pub                -- ^ local static public
   -> BS.ByteString      -- ^ 32 bytes entropy for ephemeral
   -> BS.ByteString      -- ^ Act 1 message (50 bytes)
   -> Either Error (BS.ByteString, HandshakeState)
-responder_act2 s_sec s_pub ent act1 = do
-  require (BS.length act1 == 50) InvalidLength
-  let !version = BS.index act1 0
-      !re_bytes = BS.take 33 (BS.drop 1 act1)
-      !c = BS.drop 34 act1
+act2 s_sec s_pub ent msg1 = do
+  require (BS.length msg1 == 50) InvalidLength
+  let !version = BS.index msg1 0
+      !re_bytes = BS.take 33 (BS.drop 1 msg1)
+      !c = BS.drop 34 msg1
   require (version == 0x00) InvalidVersion
   re <- note InvalidPub (parse_pub re_bytes)
   (e_sec, e_pub) <- note InvalidKey (keypair ent)
@@ -363,23 +363,23 @@ responder_act2 s_sec s_pub ent act1 = do
 -- | Initiator: process Act 2 and generate Act 3 (66 bytes), completing
 --   the handshake.
 --
---   Returns the 66-byte Act 3 message and the session result.
+--   Returns the 66-byte Act 3 message and the handshake result.
 --
 --   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
 --   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
---   >>> let Right (act1, i_hs) = initiator_act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
---   >>> let Right (act2, _) = responder_act2 r_sec r_pub (BS.replicate 32 0x22) act1
---   >>> case initiator_act3 i_hs act2 of { Right (msg, _) -> BS.length msg; Left _ -> 0 }
+--   >>> let Right (msg1, i_hs) = act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
+--   >>> let Right (msg2, _) = act2 r_sec r_pub (BS.replicate 32 0x22) msg1
+--   >>> case act3 i_hs msg2 of { Right (msg, _) -> BS.length msg; Left _ -> 0 }
 --   66
-initiator_act3
+act3
   :: HandshakeState     -- ^ state after Act 1
   -> BS.ByteString      -- ^ Act 2 message (50 bytes)
-  -> Either Error (BS.ByteString, HandshakeResult)
-initiator_act3 hs act2 = do
-  require (BS.length act2 == 50) InvalidLength
-  let !version = BS.index act2 0
-      !re_bytes = BS.take 33 (BS.drop 1 act2)
-      !c = BS.drop 34 act2
+  -> Either Error (BS.ByteString, Handshake)
+act3 hs msg2 = do
+  require (BS.length msg2 == 50) InvalidLength
+  let !version = BS.index msg2 0
+      !re_bytes = BS.take 33 (BS.drop 1 msg2)
+      !c = BS.drop 34 msg2
   require (version == 0x00) InvalidVersion
   re <- note InvalidPub (parse_pub re_bytes)
   let !h1 = mix_hash (hs_h hs) re_bytes
@@ -395,7 +395,7 @@ initiator_act3 hs act2 = do
   t <- note InvalidMAC (encrypt_with_ad temp_k3 0 h3 BS.empty)
   let !(sk, rk) = mix_key ck2 BS.empty
       !msg = BS.singleton 0x00 <> c3 <> t
-      !session = Session {
+      !sess = Session {
         sess_sk  = sk
       , sess_sn  = 0
       , sess_sck = ck2
@@ -404,32 +404,32 @@ initiator_act3 hs act2 = do
       , sess_rck = ck2
       }
   rs <- note InvalidPub (hs_rs hs)
-  let !result = HandshakeResult {
-        hr_session   = session
-      , hr_remote_pk = rs
+  let !result = Handshake {
+        session       = sess
+      , remote_static = rs
       }
   pure (msg, result)
 
 -- | Responder: process Act 3 (66 bytes) and complete the handshake.
 --
---   Returns the session result with authenticated remote static pubkey.
+--   Returns the handshake result with authenticated remote static pubkey.
 --
 --   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
 --   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
---   >>> let Right (act1, i_hs) = initiator_act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
---   >>> let Right (act2, r_hs) = responder_act2 r_sec r_pub (BS.replicate 32 0x22) act1
---   >>> let Right (act3, _) = initiator_act3 i_hs act2
---   >>> case responder_finalize r_hs act3 of { Right _ -> "ok"; Left e -> show e }
+--   >>> let Right (msg1, i_hs) = act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
+--   >>> let Right (msg2, r_hs) = act2 r_sec r_pub (BS.replicate 32 0x22) msg1
+--   >>> let Right (msg3, _) = act3 i_hs msg2
+--   >>> case finalize r_hs msg3 of { Right _ -> "ok"; Left e -> show e }
 --   "ok"
-responder_finalize
+finalize
   :: HandshakeState     -- ^ state after Act 2
   -> BS.ByteString      -- ^ Act 3 message (66 bytes)
-  -> Either Error HandshakeResult
-responder_finalize hs act3 = do
-  require (BS.length act3 == 66) InvalidLength
-  let !version = BS.index act3 0
-      !c = BS.take 49 (BS.drop 1 act3)
-      !t = BS.drop 50 act3
+  -> Either Error Handshake
+finalize hs msg3 = do
+  require (BS.length msg3 == 66) InvalidLength
+  let !version = BS.index msg3 0
+      !c = BS.take 49 (BS.drop 1 msg3)
+      !t = BS.drop 50 msg3
   require (version == 0x00) InvalidVersion
   rs_bytes <- note InvalidMAC (decrypt_with_ad (hs_temp_k hs) 1 (hs_h hs) c)
   rs <- note InvalidPub (parse_pub rs_bytes)
@@ -439,7 +439,7 @@ responder_finalize hs act3 = do
   _ <- note InvalidMAC (decrypt_with_ad temp_k3 0 h1 t)
   -- responder swaps order (receives what initiator sends)
   let !(rk, sk) = mix_key ck1 BS.empty
-      !session = Session {
+      !sess = Session {
         sess_sk  = sk
       , sess_sn  = 0
       , sess_sck = ck1
@@ -447,9 +447,9 @@ responder_finalize hs act3 = do
       , sess_rn  = 0
       , sess_rck = ck1
       }
-      !result = HandshakeResult {
-        hr_session   = session
-      , hr_remote_pk = rs
+      !result = Handshake {
+        session       = sess
+      , remote_static = rs
       }
   pure result
 
@@ -464,17 +464,17 @@ responder_finalize hs act3 = do
 --
 --   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
 --   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
---   >>> let Right (act1, i_hs) = initiator_act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
---   >>> let Right (act2, r_hs) = responder_act2 r_sec r_pub (BS.replicate 32 0x22) act1
---   >>> let Right (_, i_result) = initiator_act3 i_hs act2
---   >>> let sess = hr_session i_result
---   >>> case encrypt_message sess "hello" of { Right (ct, _) -> BS.length ct; Left _ -> 0 }
+--   >>> let Right (msg1, i_hs) = act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
+--   >>> let Right (msg2, _) = act2 r_sec r_pub (BS.replicate 32 0x22) msg1
+--   >>> let Right (_, i_result) = act3 i_hs msg2
+--   >>> let sess = session i_result
+--   >>> case encrypt sess "hello" of { Right (ct, _) -> BS.length ct; Left _ -> 0 }
 --   39
-encrypt_message
+encrypt
   :: Session
   -> BS.ByteString          -- ^ plaintext (max 65535 bytes)
   -> Either Error (BS.ByteString, Session)
-encrypt_message sess pt = do
+encrypt sess pt = do
   let !len = BS.length pt
   require (len <= 65535) InvalidLength
   let !len_bytes = encode_be16 (fi len)
@@ -498,18 +498,18 @@ encrypt_message sess pt = do
 --
 --   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
 --   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
---   >>> let Right (act1, i_hs) = initiator_act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
---   >>> let Right (act2, r_hs) = responder_act2 r_sec r_pub (BS.replicate 32 0x22) act1
---   >>> let Right (act3, i_result) = initiator_act3 i_hs act2
---   >>> let Right r_result = responder_finalize r_hs act3
---   >>> let Right (ct, _) = encrypt_message (hr_session i_result) "hello"
---   >>> case decrypt_message (hr_session r_result) ct of { Right (pt, _) -> pt; Left _ -> "fail" }
+--   >>> let Right (msg1, i_hs) = act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
+--   >>> let Right (msg2, r_hs) = act2 r_sec r_pub (BS.replicate 32 0x22) msg1
+--   >>> let Right (msg3, i_result) = act3 i_hs msg2
+--   >>> let Right r_result = finalize r_hs msg3
+--   >>> let Right (ct, _) = encrypt (session i_result) "hello"
+--   >>> case decrypt (session r_result) ct of { Right (pt, _) -> pt; Left _ -> "fail" }
 --   "hello"
-decrypt_message
+decrypt
   :: Session
   -> BS.ByteString          -- ^ encrypted packet
   -> Either Error (BS.ByteString, Session)
-decrypt_message sess packet = do
+decrypt sess packet = do
   require (BS.length packet >= 34) InvalidLength
   let !lc = BS.take 18 packet
       !rest = BS.drop 18 packet

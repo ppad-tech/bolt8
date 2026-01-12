@@ -16,7 +16,7 @@ instance NFData BOLT8.Sec
 instance NFData BOLT8.Error
 instance NFData BOLT8.Session
 instance NFData BOLT8.HandshakeState
-instance NFData BOLT8.HandshakeResult
+instance NFData BOLT8.Handshake
 
 main :: IO ()
 main = defaultMain [
@@ -43,40 +43,30 @@ keys = bgroup "keys" [
     r_s_pub_bs = BOLT8.serialize_pub r_s_pub
 
 handshake :: Benchmark
-handshake = env setup $ \ ~(i_s_sec, i_s_pub, r_s_sec, r_s_pub, act1, i_hs,
-                            act2, r_hs, act3) ->
+handshake = env setup $ \ ~(i_s_sec, i_s_pub, r_s_sec, r_s_pub, msg1, i_hs,
+                            msg2, r_hs, msg3) ->
     bgroup "handshake" [
-      bench "initiator_act1" $
-        nf (BOLT8.initiator_act1 i_s_sec i_s_pub r_s_pub) i_e_ent
-    , bench "responder_act2" $
-        nf (BOLT8.responder_act2 r_s_sec r_s_pub r_e_ent) act1
-    , bench "initiator_act3" $
-        nf (BOLT8.initiator_act3 i_hs) act2
-    , bench "responder_finalize" $
-        nf (BOLT8.responder_finalize r_hs) act3
+      bench "act1" $ nf (BOLT8.act1 i_s_sec i_s_pub r_s_pub) i_e_ent
+    , bench "act2" $ nf (BOLT8.act2 r_s_sec r_s_pub r_e_ent) msg1
+    , bench "act3" $ nf (BOLT8.act3 i_hs) msg2
+    , bench "finalize" $ nf (BOLT8.finalize r_hs) msg3
     ]
   where
     setup = do
       let Just (!i_s_sec, !i_s_pub) = BOLT8.keypair i_s_ent
           Just (!r_s_sec, !r_s_pub) = BOLT8.keypair r_s_ent
-          Right (!act1, !i_hs) =
-            BOLT8.initiator_act1 i_s_sec i_s_pub r_s_pub i_e_ent
-          Right (!act2, !r_hs) =
-            BOLT8.responder_act2 r_s_sec r_s_pub r_e_ent act1
-          Right (!act3, _) = BOLT8.initiator_act3 i_hs act2
-      pure (i_s_sec, i_s_pub, r_s_sec, r_s_pub, act1, i_hs, act2, r_hs, act3)
+          Right (!msg1, !i_hs) = BOLT8.act1 i_s_sec i_s_pub r_s_pub i_e_ent
+          Right (!msg2, !r_hs) = BOLT8.act2 r_s_sec r_s_pub r_e_ent msg1
+          Right (!msg3, _) = BOLT8.act3 i_hs msg2
+      pure (i_s_sec, i_s_pub, r_s_sec, r_s_pub, msg1, i_hs, msg2, r_hs, msg3)
 
 messages :: Benchmark
 messages = env setup $ \ ~(i_sess, r_sess, ct_small, ct_large) ->
     bgroup "messages" [
-      bench "encrypt (32B)" $
-        nf (BOLT8.encrypt_message i_sess) small_msg
-    , bench "encrypt (1KB)" $
-        nf (BOLT8.encrypt_message i_sess) large_msg
-    , bench "decrypt (32B)" $
-        nf (BOLT8.decrypt_message r_sess) ct_small
-    , bench "decrypt (1KB)" $
-        nf (BOLT8.decrypt_message r_sess) ct_large
+      bench "encrypt (32B)" $ nf (BOLT8.encrypt i_sess) small_msg
+    , bench "encrypt (1KB)" $ nf (BOLT8.encrypt i_sess) large_msg
+    , bench "decrypt (32B)" $ nf (BOLT8.decrypt r_sess) ct_small
+    , bench "decrypt (1KB)" $ nf (BOLT8.decrypt r_sess) ct_large
     ]
   where
     small_msg = BS.replicate 32 0x00
@@ -84,14 +74,12 @@ messages = env setup $ \ ~(i_sess, r_sess, ct_small, ct_large) ->
     setup = do
       let Just (!i_s_sec, !i_s_pub) = BOLT8.keypair i_s_ent
           Just (!r_s_sec, !r_s_pub) = BOLT8.keypair r_s_ent
-          Right (act1, i_hs) =
-            BOLT8.initiator_act1 i_s_sec i_s_pub r_s_pub i_e_ent
-          Right (act2, r_hs) =
-            BOLT8.responder_act2 r_s_sec r_s_pub r_e_ent act1
-          Right (act3, i_result) = BOLT8.initiator_act3 i_hs act2
-          Right r_result = BOLT8.responder_finalize r_hs act3
-          !i_sess = BOLT8.hr_session i_result
-          !r_sess = BOLT8.hr_session r_result
-          Right (!ct_small, _) = BOLT8.encrypt_message i_sess small_msg
-          Right (!ct_large, _) = BOLT8.encrypt_message i_sess large_msg
+          Right (msg1, i_hs) = BOLT8.act1 i_s_sec i_s_pub r_s_pub i_e_ent
+          Right (msg2, r_hs) = BOLT8.act2 r_s_sec r_s_pub r_e_ent msg1
+          Right (msg3, i_result) = BOLT8.act3 i_hs msg2
+          Right r_result = BOLT8.finalize r_hs msg3
+          !i_sess = BOLT8.session i_result
+          !r_sess = BOLT8.session r_result
+          Right (!ct_small, _) = BOLT8.encrypt i_sess small_msg
+          Right (!ct_large, _) = BOLT8.encrypt i_sess large_msg
       pure (i_sess, r_sess, ct_small, ct_large)

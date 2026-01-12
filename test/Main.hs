@@ -73,7 +73,7 @@ test_act1 :: Assertion
 test_act1 = do
   let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
       Just rs = BOLT8.parse_pub responder_s_pub
-  case BOLT8.initiator_act1 i_s_sec i_s_pub rs initiator_e_priv of
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
     Left err -> assertFailure $ "act1 failed: " ++ show err
     Right (act1_msg, _hs) -> act1_msg @?= expected_act1
 
@@ -83,14 +83,12 @@ test_act2 = do
       Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
       Just rs = BOLT8.parse_pub responder_s_pub
 
-  -- initiator generates act1
-  case BOLT8.initiator_act1 i_s_sec i_s_pub rs initiator_e_priv of
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
     Left err -> assertFailure $ "act1 failed: " ++ show err
-    Right (act1_msg, _) -> do
-      -- responder processes act1 and generates act2
-      case BOLT8.responder_act2 r_s_sec r_s_pub responder_e_priv act1_msg of
+    Right (msg1, _) -> do
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
         Left err -> assertFailure $ "act2 failed: " ++ show err
-        Right (act2_msg, _) -> act2_msg @?= expected_act2
+        Right (msg2, _) -> msg2 @?= expected_act2
 
 test_act3 :: Assertion
 test_act3 = do
@@ -98,18 +96,15 @@ test_act3 = do
       Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
       Just rs = BOLT8.parse_pub responder_s_pub
 
-  -- initiator generates act1
-  case BOLT8.initiator_act1 i_s_sec i_s_pub rs initiator_e_priv of
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
     Left err -> assertFailure $ "act1 failed: " ++ show err
-    Right (act1_msg, i_hs) -> do
-      -- responder processes act1 and generates act2
-      case BOLT8.responder_act2 r_s_sec r_s_pub responder_e_priv act1_msg of
+    Right (msg1, i_hs) -> do
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
         Left err -> assertFailure $ "act2 failed: " ++ show err
-        Right (act2_msg, _) -> do
-          -- initiator processes act2 and generates act3
-          case BOLT8.initiator_act3 i_hs act2_msg of
+        Right (msg2, _) -> do
+          case BOLT8.act3 i_hs msg2 of
             Left err -> assertFailure $ "act3 failed: " ++ show err
-            Right (act3_msg, _) -> act3_msg @?= expected_act3
+            Right (msg3, _) -> msg3 @?= expected_act3
 
 test_full_handshake :: Assertion
 test_full_handshake = do
@@ -117,25 +112,20 @@ test_full_handshake = do
       Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
       Just rs = BOLT8.parse_pub responder_s_pub
 
-  -- Act 1: initiator generates
-  case BOLT8.initiator_act1 i_s_sec i_s_pub rs initiator_e_priv of
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
     Left err -> assertFailure $ "act1 failed: " ++ show err
-    Right (act1_msg, i_hs) -> do
-      -- Act 2: responder processes act1, generates act2
-      case BOLT8.responder_act2 r_s_sec r_s_pub responder_e_priv act1_msg of
+    Right (msg1, i_hs) -> do
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
         Left err -> assertFailure $ "act2 failed: " ++ show err
-        Right (act2_msg, r_hs) -> do
-          -- Act 3: initiator processes act2, generates act3
-          case BOLT8.initiator_act3 i_hs act2_msg of
+        Right (msg2, r_hs) -> do
+          case BOLT8.act3 i_hs msg2 of
             Left err -> assertFailure $ "act3 failed: " ++ show err
-            Right (act3_msg, i_result) -> do
-              -- Responder finalizes
-              case BOLT8.responder_finalize r_hs act3_msg of
+            Right (msg3, i_result) -> do
+              case BOLT8.finalize r_hs msg3 of
                 Left err -> assertFailure $ "finalize failed: " ++ show err
                 Right r_result -> do
-                  -- Verify remote pubkeys match
-                  BOLT8.hr_remote_pk i_result @?= r_s_pub
-                  BOLT8.hr_remote_pk r_result @?= i_s_pub
+                  BOLT8.remote_static i_result @?= r_s_pub
+                  BOLT8.remote_static r_result @?= i_s_pub
 
 -- message encryption tests --------------------------------------------------
 
@@ -192,25 +182,25 @@ get_initiator_session = do
       Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
       Just rs = BOLT8.parse_pub responder_s_pub
 
-  case BOLT8.initiator_act1 i_s_sec i_s_pub rs initiator_e_priv of
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
     Left err -> fail $ "act1 failed: " ++ show err
-    Right (act1_msg, i_hs) ->
-      case BOLT8.responder_act2 r_s_sec r_s_pub responder_e_priv act1_msg of
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
         Left err -> fail $ "act2 failed: " ++ show err
-        Right (act2_msg, _) ->
-          case BOLT8.initiator_act3 i_hs act2_msg of
+        Right (msg2, _) ->
+          case BOLT8.act3 i_hs msg2 of
             Left err -> fail $ "act3 failed: " ++ show err
-            Right (_, result) -> pure (BOLT8.hr_session result)
+            Right (_, result) -> pure (BOLT8.session result)
 
 -- encrypt N messages, return Nth ciphertext
 encrypt_n :: Int -> BOLT8.Session -> IO BS.ByteString
 encrypt_n n sess0 = go 0 sess0
   where
     go i sess
-      | i == n = case BOLT8.encrypt_message sess hello of
+      | i == n = case BOLT8.encrypt sess hello of
           Left err -> fail $ "encrypt failed at " ++ show i ++ ": " ++ show err
           Right (ct, _) -> pure ct
-      | otherwise = case BOLT8.encrypt_message sess hello of
+      | otherwise = case BOLT8.encrypt sess hello of
           Left err -> fail $ "encrypt failed at " ++ show i ++ ": " ++ show err
           Right (_, sess') -> go (i + 1) sess'
 
@@ -256,26 +246,24 @@ test_decrypt_roundtrip = do
       Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
       Just rs = BOLT8.parse_pub responder_s_pub
 
-  -- Complete handshake
-  case BOLT8.initiator_act1 i_s_sec i_s_pub rs initiator_e_priv of
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
     Left err -> assertFailure $ "act1 failed: " ++ show err
-    Right (act1_msg, i_hs) ->
-      case BOLT8.responder_act2 r_s_sec r_s_pub responder_e_priv act1_msg of
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
         Left err -> assertFailure $ "act2 failed: " ++ show err
-        Right (act2_msg, r_hs) ->
-          case BOLT8.initiator_act3 i_hs act2_msg of
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
             Left err -> assertFailure $ "act3 failed: " ++ show err
-            Right (act3_msg, i_result) ->
-              case BOLT8.responder_finalize r_hs act3_msg of
+            Right (msg3, i_result) ->
+              case BOLT8.finalize r_hs msg3 of
                 Left err -> assertFailure $ "finalize failed: " ++ show err
                 Right r_result -> do
-                  let i_sess = BOLT8.hr_session i_result
-                      r_sess = BOLT8.hr_session r_result
-                  -- Initiator sends to responder
-                  case BOLT8.encrypt_message i_sess hello of
+                  let i_sess = BOLT8.session i_result
+                      r_sess = BOLT8.session r_result
+                  case BOLT8.encrypt i_sess hello of
                     Left err -> assertFailure $ "encrypt failed: " ++ show err
                     Right (ct, _) ->
-                      case BOLT8.decrypt_message r_sess ct of
+                      case BOLT8.decrypt r_sess ct of
                         Left err ->
                           assertFailure $ "decrypt failed: " ++ show err
                         Right (pt, _) -> pt @?= hello
