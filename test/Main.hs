@@ -12,6 +12,7 @@ main :: IO ()
 main = defaultMain $ testGroup "ppad-bolt8" [
     handshake_tests
   , message_tests
+  , framing_tests
   ]
 
 -- test vectors from BOLT #8 specification -----------------------------------
@@ -267,6 +268,124 @@ test_decrypt_roundtrip = do
                         Left err ->
                           assertFailure $ "decrypt failed: " ++ show err
                         Right (pt, _) -> pt @?= hello
+
+-- framing tests -------------------------------------------------------------
+
+framing_tests :: TestTree
+framing_tests = testGroup "Packet Framing" [
+    testCase "decrypt rejects trailing bytes" test_decrypt_trailing
+  , testCase "decrypt_frame returns remainder" test_decrypt_frame_remainder
+  , testCase "decrypt_frame handles multiple frames" test_decrypt_frame_multi
+  ]
+
+test_decrypt_trailing :: Assertion
+test_decrypt_trailing = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, i_result) ->
+              case BOLT8.finalize r_hs msg3 of
+                Left err -> assertFailure $ "finalize failed: " ++ show err
+                Right r_result -> do
+                  let i_sess = BOLT8.session i_result
+                      r_sess = BOLT8.session r_result
+                  case BOLT8.encrypt i_sess hello of
+                    Left err -> assertFailure $ "encrypt failed: " ++ show err
+                    Right (ct, _) -> do
+                      -- append trailing bytes
+                      let ct_with_trailing = ct <> "extra"
+                      case BOLT8.decrypt r_sess ct_with_trailing of
+                        Left BOLT8.InvalidLength -> pure ()
+                        Left err ->
+                          assertFailure $ "expected InvalidLength, got: "
+                            ++ show err
+                        Right _ ->
+                          assertFailure "decrypt should reject trailing bytes"
+
+test_decrypt_frame_remainder :: Assertion
+test_decrypt_frame_remainder = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, i_result) ->
+              case BOLT8.finalize r_hs msg3 of
+                Left err -> assertFailure $ "finalize failed: " ++ show err
+                Right r_result -> do
+                  let i_sess = BOLT8.session i_result
+                      r_sess = BOLT8.session r_result
+                  case BOLT8.encrypt i_sess hello of
+                    Left err -> assertFailure $ "encrypt failed: " ++ show err
+                    Right (ct, _) -> do
+                      let trailing = "remainder"
+                          ct_with_trailing = ct <> trailing
+                      case BOLT8.decrypt_frame r_sess ct_with_trailing of
+                        Left err ->
+                          assertFailure $ "decrypt_frame failed: " ++ show err
+                        Right (pt, remainder, _) -> do
+                          pt @?= hello
+                          remainder @?= trailing
+
+test_decrypt_frame_multi :: Assertion
+test_decrypt_frame_multi = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, i_result) ->
+              case BOLT8.finalize r_hs msg3 of
+                Left err -> assertFailure $ "finalize failed: " ++ show err
+                Right r_result -> do
+                  let i_sess = BOLT8.session i_result
+                      r_sess = BOLT8.session r_result
+                  -- encrypt two messages
+                  case BOLT8.encrypt i_sess "first" of
+                    Left err -> assertFailure $ "encrypt 1 failed: " ++ show err
+                    Right (ct1, i_sess') ->
+                      case BOLT8.encrypt i_sess' "second" of
+                        Left err ->
+                          assertFailure $ "encrypt 2 failed: " ++ show err
+                        Right (ct2, _) -> do
+                          -- concatenate frames
+                          let buffer = ct1 <> ct2
+                          -- decrypt first frame
+                          case BOLT8.decrypt_frame r_sess buffer of
+                            Left err ->
+                              assertFailure $ "frame 1 failed: " ++ show err
+                            Right (pt1, rest, r_sess') -> do
+                              pt1 @?= "first"
+                              -- decrypt second frame from remainder
+                              case BOLT8.decrypt_frame r_sess' rest of
+                                Left err ->
+                                  assertFailure $ "frame 2 failed: " ++ show err
+                                Right (pt2, rest2, _) -> do
+                                  pt2 @?= "second"
+                                  rest2 @?= BS.empty
 
 -- utilities -----------------------------------------------------------------
 
