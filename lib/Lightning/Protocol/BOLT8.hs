@@ -81,6 +81,7 @@ module Lightning.Protocol.BOLT8 (
   , Handshake(..)
   , encrypt
   , decrypt
+  , decrypt_frame
 
     -- * Errors
   , Error(..)
@@ -532,10 +533,14 @@ encrypt sess pt = do
       }
   pure (packet, sess')
 
--- | Decrypt a message.
+-- | Decrypt a message, requiring an exact packet with no trailing bytes.
 --
 --   Returns the plaintext and updated session. Key rotation
---   is handled automatically every 500 messages.
+--   is handled automatically every 1000 messages.
+--
+--   This is a strict variant that rejects any trailing data. For
+--   streaming use cases where you need to handle multiple frames in a
+--   buffer, use 'decrypt_frame' instead.
 --
 --   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
 --   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
@@ -548,9 +553,38 @@ encrypt sess pt = do
 --   "hello"
 decrypt
   :: Session
-  -> BS.ByteString          -- ^ encrypted packet
+  -> BS.ByteString          -- ^ encrypted packet (exact length required)
   -> Either Error (BS.ByteString, Session)
 decrypt sess packet = do
+  (pt, remainder, sess') <- decrypt_frame sess packet
+  require (BS.null remainder) InvalidLength
+  pure (pt, sess')
+
+-- | Decrypt a single frame from a buffer, returning the remainder.
+--
+--   Returns the plaintext, any unconsumed bytes, and the updated session.
+--   Key rotation is handled automatically every 1000 messages.
+--
+--   This is useful for streaming scenarios where multiple messages may
+--   be buffered together. The remainder can be passed to the next call
+--   to 'decrypt_frame'.
+--
+--   Wire format consumed: encrypted_length (18) || encrypted_body (len + 16)
+--
+--   >>> let Just (i_sec, i_pub) = keypair (BS.replicate 32 0x11)
+--   >>> let Just (r_sec, r_pub) = keypair (BS.replicate 32 0x21)
+--   >>> let Right (msg1, i_hs) = act1 i_sec i_pub r_pub (BS.replicate 32 0x12)
+--   >>> let Right (msg2, r_hs) = act2 r_sec r_pub (BS.replicate 32 0x22) msg1
+--   >>> let Right (msg3, i_result) = act3 i_hs msg2
+--   >>> let Right r_result = finalize r_hs msg3
+--   >>> let Right (ct, _) = encrypt (session i_result) "hello"
+--   >>> case decrypt_frame (session r_result) ct of { Right (pt, rem, _) -> (pt, BS.null rem); Left _ -> ("fail", False) }
+--   ("hello",True)
+decrypt_frame
+  :: Session
+  -> BS.ByteString          -- ^ buffer containing at least one encrypted frame
+  -> Either Error (BS.ByteString, BS.ByteString, Session)
+decrypt_frame sess packet = do
   require (BS.length packet >= 34) InvalidLength
   let !lc = BS.take 18 packet
       !rest = BS.drop 18 packet
@@ -561,6 +595,7 @@ decrypt sess packet = do
       !body_len = fi len + 16
   require (BS.length rest >= body_len) InvalidLength
   let !bc = BS.take body_len rest
+      !remainder = BS.drop body_len rest
   pt <- note InvalidMAC (decrypt_with_ad rk1 rn1 BS.empty bc)
   let !(rn2, rck2, rk2) = step_nonce rn1 rck1 rk1
       !sess' = sess {
@@ -568,7 +603,7 @@ decrypt sess packet = do
       , sess_rn  = rn2
       , sess_rck = rck2
       }
-  pure (pt, sess')
+  pure (pt, remainder, sess')
 
 -- key rotation --------------------------------------------------------------
 
