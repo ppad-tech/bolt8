@@ -9,6 +9,8 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Lightning.Protocol.BOLT8 as BOLT8
 import Test.Tasty
 import Test.Tasty.HUnit
+import Test.Tasty.QuickCheck (Gen, Property, choose, forAll, testProperty,
+                              vectorOf)
 
 -- test helpers ----------------------------------------------------------------
 
@@ -31,6 +33,7 @@ main = defaultMain $ testGroup "ppad-bolt8" [
   , framing_tests
   , partial_framing_tests
   , negative_tests
+  , property_tests
   ]
 
 -- test vectors from BOLT #8 specification -----------------------------------
@@ -547,3 +550,108 @@ hex :: BS.ByteString -> BS.ByteString
 hex bs = case B16.decode bs of
   Nothing -> error "hex: invalid test vector literal"
   Just r  -> r
+
+-- property tests --------------------------------------------------------------
+
+property_tests :: TestTree
+property_tests = testGroup "Properties" [
+    testProperty "handshake round-trip" prop_handshake_roundtrip
+  , testProperty "encrypt/decrypt round-trip" prop_encrypt_decrypt_roundtrip
+  , testProperty "decrypt_frame consumes one frame" prop_frame_consumes_one
+  , testProperty "decrypt_frame_partial NeedMore on short"
+      prop_partial_needmore_short
+  ]
+
+-- generators ------------------------------------------------------------------
+
+-- | Generate 32 bytes of entropy that yields a valid keypair.
+genValidEntropy :: Gen BS.ByteString
+genValidEntropy = do
+  bytes <- BS.pack <$> vectorOf 32 (choose (0, 255))
+  case BOLT8.keypair bytes of
+    Just _  -> pure bytes
+    Nothing -> genValidEntropy
+
+-- | Generate a payload of 0..256 bytes.
+genPayload :: Gen BS.ByteString
+genPayload = do
+  len <- choose (0, 256)
+  BS.pack <$> vectorOf len (choose (0, 255))
+
+-- | Perform a full handshake with given static key entropy.
+-- Uses fixed ephemeral keys for determinism.
+doHandshake
+  :: BS.ByteString
+  -> BS.ByteString
+  -> Maybe (BOLT8.Session, BOLT8.Session)
+doHandshake i_entropy r_entropy = do
+  (i_s_sec, i_s_pub) <- BOLT8.keypair i_entropy
+  (r_s_sec, r_s_pub) <- BOLT8.keypair r_entropy
+  let i_e = BS.replicate 32 0x12
+      r_e = BS.replicate 32 0x22
+  (msg1, i_hs) <- either (const Nothing) Just $
+    BOLT8.act1 i_s_sec i_s_pub r_s_pub i_e
+  (msg2, r_hs) <- either (const Nothing) Just $
+    BOLT8.act2 r_s_sec r_s_pub r_e msg1
+  (msg3, i_res) <- either (const Nothing) Just $
+    BOLT8.act3 i_hs msg2
+  r_res <- either (const Nothing) Just $
+    BOLT8.finalize r_hs msg3
+  pure (BOLT8.session i_res, BOLT8.session r_res)
+
+-- properties ------------------------------------------------------------------
+
+-- | Handshake succeeds for valid keys and sessions are consistent.
+prop_handshake_roundtrip :: Property
+prop_handshake_roundtrip = forAll genValidEntropy $ \i_ent ->
+  forAll genValidEntropy $ \r_ent ->
+    case doHandshake i_ent r_ent of
+      Nothing -> False
+      Just _  -> True
+
+-- | Encrypt then decrypt yields original payload.
+prop_encrypt_decrypt_roundtrip :: Property
+prop_encrypt_decrypt_roundtrip = forAll genPayload $ \payload ->
+  case doHandshake initiator_s_priv responder_s_priv of
+    Nothing -> False
+    Just (i_sess, r_sess) ->
+      case BOLT8.encrypt i_sess payload of
+        Left _ -> False
+        Right (ct, _) ->
+          case BOLT8.decrypt r_sess ct of
+            Left _ -> False
+            Right (pt, _) -> pt == payload
+
+-- | decrypt_frame consumes exactly one frame and returns remainder.
+prop_frame_consumes_one :: Property
+prop_frame_consumes_one = forAll genPayload $ \p1 ->
+  forAll genPayload $ \p2 ->
+    case doHandshake initiator_s_priv responder_s_priv of
+      Nothing -> False
+      Just (i_sess, r_sess) ->
+        case BOLT8.encrypt i_sess p1 of
+          Left _ -> False
+          Right (ct1, i_sess') ->
+            case BOLT8.encrypt i_sess' p2 of
+              Left _ -> False
+              Right (ct2, _) ->
+                let buf = ct1 <> ct2
+                in case BOLT8.decrypt_frame r_sess buf of
+                  Left _ -> False
+                  Right (pt1, rest, r_sess') ->
+                    pt1 == p1 &&
+                    case BOLT8.decrypt_frame r_sess' rest of
+                      Left _ -> False
+                      Right (pt2, rest2, _) ->
+                        pt2 == p2 && BS.null rest2
+
+-- | decrypt_frame_partial returns NeedMore when buffer < 18 bytes.
+prop_partial_needmore_short :: Property
+prop_partial_needmore_short = forAll (choose (0, 17)) $ \len ->
+  case doHandshake initiator_s_priv responder_s_priv of
+    Nothing -> False
+    Just (_, r_sess) ->
+      let buf = BS.replicate len 0x00
+      in case BOLT8.decrypt_frame_partial r_sess buf of
+        BOLT8.NeedMore n -> n == 18 - len
+        _                -> False

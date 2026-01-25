@@ -47,8 +47,10 @@ test-suite bolt8-tests
     , bytestring
     , ppad-base16
     , ppad-bolt8
+    , QuickCheck
     , tasty
     , tasty-hunit
+    , tasty-quickcheck
 
 benchmark bolt8-bench
   type:                exitcode-stdio-1.0
