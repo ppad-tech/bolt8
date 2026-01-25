@@ -57,6 +57,13 @@
 -- (plaintext, session') <- 'decrypt' session ciphertext
 -- @
 --
+-- = Message Framing
+--
+-- BOLT #8 runs over a byte stream, so callers often need to deal with
+-- partial buffers. Use 'decrypt_frame' when you have exactly one frame,
+-- or 'decrypt_frame_partial' to handle incremental reads and return how
+-- many bytes are still needed.
+--
 -- Maximum plaintext size is 65535 bytes.
 
 module Lightning.Protocol.BOLT8 (
