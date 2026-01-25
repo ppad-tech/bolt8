@@ -218,6 +218,9 @@ mix_hash :: BS.ByteString -> BS.ByteString -> BS.ByteString
 mix_hash h dat = SHA256.hash (h <> dat)
 
 -- Mix key: (ck', k) = HKDF(ck, input_key_material)
+--
+-- NB HKDF limits output to 255 * hashlen bytes. For SHA256 that's 8160,
+-- well above the 64 bytes requested here, so 'Nothing' is impossible.
 mix_key :: BS.ByteString -> BS.ByteString -> (BS.ByteString, BS.ByteString)
 mix_key ck ikm = case HKDF.derive hmac ck mempty 64 ikm of
     Nothing -> error "ppad-bolt8: internal error, please report a bug!"
