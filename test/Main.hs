@@ -489,10 +489,12 @@ test_decrypt_short_packet = do
 
 -- flip one byte in a bytestring at given index
 flip_byte :: Int -> BS.ByteString -> BS.ByteString
-flip_byte i bs =
-  let (pre, post) = BS.splitAt i bs
-      b = BS.index post 0
-  in pre <> BS.cons (b `xor` 0xff) (BS.drop 1 post)
+flip_byte i bs
+  | i < 0 || i >= BS.length bs = error "flip_byte: index out of bounds"
+  | otherwise =
+      let (pre, post) = BS.splitAt i bs
+          b = BS.index post 0
+      in pre <> BS.cons (b `xor` 0xff) (BS.drop 1 post)
 
 -- utilities -----------------------------------------------------------------
 
