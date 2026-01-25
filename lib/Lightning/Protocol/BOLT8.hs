@@ -82,6 +82,8 @@ module Lightning.Protocol.BOLT8 (
   , encrypt
   , decrypt
   , decrypt_frame
+  , decrypt_frame_partial
+  , FrameResult(..)
 
     -- * Errors
   , Error(..)
@@ -122,6 +124,16 @@ data Error =
   | InvalidLength
   | DecryptionFailed
   deriving (Eq, Show, Generic)
+
+-- | Result of attempting to decrypt a frame from a partial buffer.
+data FrameResult =
+    NeedMore {-# UNPACK #-} !Int
+    -- ^ More bytes needed; the 'Int' is the minimum additional bytes required.
+  | FrameOk !BS.ByteString !BS.ByteString !Session
+    -- ^ Successfully decrypted: plaintext, remainder, updated session.
+  | FrameError !Error
+    -- ^ Decryption failed with the given error.
+  deriving Generic
 
 -- | Post-handshake session state.
 data Session = Session {
@@ -607,6 +619,56 @@ decrypt_frame sess packet = do
       , sess_rck = rck2
       }
   pure (pt, remainder, sess')
+
+-- | Decrypt a frame from a partial buffer, indicating when more data needed.
+--
+--   Unlike 'decrypt_frame', this function handles incomplete buffers
+--   gracefully by returning 'NeedMore' with the number of additional
+--   bytes required to make progress.
+--
+--   * If the buffer has fewer than 18 bytes (encrypted length + MAC),
+--     returns @'NeedMore' n@ where @n@ is the bytes still needed.
+--   * If the length header is complete but the body is incomplete,
+--     returns @'NeedMore' n@ with bytes needed for the full frame.
+--   * MAC or decryption failures return 'FrameError'.
+--   * A complete, valid frame returns 'FrameOk' with plaintext,
+--     remainder, and updated session.
+--
+--   This is useful for non-blocking I/O where data arrives incrementally.
+decrypt_frame_partial
+  :: Session
+  -> BS.ByteString  -- ^ buffer (possibly incomplete)
+  -> FrameResult
+decrypt_frame_partial sess buf
+  | buflen < 18 = NeedMore (18 - buflen)
+  | otherwise =
+      let !lc = BS.take 18 buf
+          !rest = BS.drop 18 buf
+      in case decrypt_with_ad (sess_rk sess) (sess_rn sess) BS.empty lc of
+           Nothing -> FrameError InvalidMAC
+           Just len_bytes -> case decode_be16 len_bytes of
+             Nothing -> FrameError InvalidLength
+             Just len ->
+               let !body_len = fi len + 16
+                   !(rn1, rck1, rk1) = step_nonce (sess_rn sess)
+                                        (sess_rck sess) (sess_rk sess)
+               in if BS.length rest < body_len
+                    then NeedMore (body_len - BS.length rest)
+                    else
+                      let !bc = BS.take body_len rest
+                          !remainder = BS.drop body_len rest
+                      in case decrypt_with_ad rk1 rn1 BS.empty bc of
+                           Nothing -> FrameError InvalidMAC
+                           Just pt ->
+                             let !(rn2, rck2, rk2) = step_nonce rn1 rck1 rk1
+                                 !sess' = sess {
+                                   sess_rk  = rk2
+                                 , sess_rn  = rn2
+                                 , sess_rck = rck2
+                                 }
+                             in FrameOk pt remainder sess'
+  where
+    !buflen = BS.length buf
 
 -- key rotation --------------------------------------------------------------
 
