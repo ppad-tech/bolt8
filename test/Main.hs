@@ -2,6 +2,7 @@
 
 module Main where
 
+import Data.Bits (xor)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Lightning.Protocol.BOLT8 as BOLT8
@@ -13,6 +14,7 @@ main = defaultMain $ testGroup "ppad-bolt8" [
     handshake_tests
   , message_tests
   , framing_tests
+  , negative_tests
   ]
 
 -- test vectors from BOLT #8 specification -----------------------------------
@@ -386,6 +388,111 @@ test_decrypt_frame_multi = do
                                 Right (pt2, rest2, _) -> do
                                   pt2 @?= "second"
                                   rest2 @?= BS.empty
+
+-- negative tests ------------------------------------------------------------
+
+negative_tests :: TestTree
+negative_tests = testGroup "Negative Tests" [
+    testCase "act2 rejects wrong version" test_act2_wrong_version
+  , testCase "act2 rejects wrong length" test_act2_wrong_length
+  , testCase "act3 rejects invalid MAC" test_act3_invalid_mac
+  , testCase "finalize rejects invalid MAC" test_finalize_invalid_mac
+  , testCase "decrypt rejects short packet" test_decrypt_short_packet
+  ]
+
+test_act2_wrong_version :: Assertion
+test_act2_wrong_version = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, _) -> do
+      let bad_msg1 = BS.cons 0x01 (BS.drop 1 msg1)
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv bad_msg1 of
+        Left BOLT8.InvalidVersion -> pure ()
+        Left err -> assertFailure $ "expected InvalidVersion, got: " ++ show err
+        Right _ -> assertFailure "expected rejection, got success"
+
+test_act2_wrong_length :: Assertion
+test_act2_wrong_length = do
+  let Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      short_msg = BS.replicate 49 0x00
+  case BOLT8.act2 r_s_sec r_s_pub responder_e_priv short_msg of
+    Left BOLT8.InvalidLength -> pure ()
+    Left err -> assertFailure $ "expected InvalidLength, got: " ++ show err
+    Right _ -> assertFailure "expected rejection, got success"
+
+test_act3_invalid_mac :: Assertion
+test_act3_invalid_mac = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, _) -> do
+          let bad_msg2 = flip_byte 40 msg2
+          case BOLT8.act3 i_hs bad_msg2 of
+            Left BOLT8.InvalidMAC -> pure ()
+            Left err ->
+              assertFailure $ "expected InvalidMAC, got: " ++ show err
+            Right _ -> assertFailure "expected rejection, got success"
+
+test_finalize_invalid_mac :: Assertion
+test_finalize_invalid_mac = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, _) -> do
+              let bad_msg3 = flip_byte 20 msg3
+              case BOLT8.finalize r_hs bad_msg3 of
+                Left BOLT8.InvalidMAC -> pure ()
+                Left err ->
+                  assertFailure $ "expected InvalidMAC, got: " ++ show err
+                Right _ -> assertFailure "expected rejection, got success"
+
+test_decrypt_short_packet :: Assertion
+test_decrypt_short_packet = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, _) ->
+              case BOLT8.finalize r_hs msg3 of
+                Left err -> assertFailure $ "finalize failed: " ++ show err
+                Right r_result -> do
+                  let r_sess = BOLT8.session r_result
+                      short_packet = BS.replicate 17 0x00
+                  case BOLT8.decrypt r_sess short_packet of
+                    Left BOLT8.InvalidLength -> pure ()
+                    Left err ->
+                      assertFailure $ "expected InvalidLength, got: " ++ show err
+                    Right _ -> assertFailure "expected rejection, got success"
+
+-- flip one byte in a bytestring at given index
+flip_byte :: Int -> BS.ByteString -> BS.ByteString
+flip_byte i bs =
+  let (pre, post) = BS.splitAt i bs
+      b = BS.index post 0
+  in pre <> BS.cons (b `xor` 0xff) (BS.drop 1 post)
 
 -- utilities -----------------------------------------------------------------
 

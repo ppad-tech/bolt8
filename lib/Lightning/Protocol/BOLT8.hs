@@ -503,7 +503,7 @@ finalize hs msg3 = do
 -- | Encrypt a message (max 65535 bytes).
 --
 --   Returns the encrypted packet and updated session. Key rotation
---   is handled automatically every 500 messages.
+--   is handled automatically at nonce 1000.
 --
 --   Wire format: encrypted_length (2) || MAC (16) || encrypted_body || MAC (16)
 --
@@ -539,7 +539,7 @@ encrypt sess pt = do
 -- | Decrypt a message, requiring an exact packet with no trailing bytes.
 --
 --   Returns the plaintext and updated session. Key rotation
---   is handled automatically every 1000 messages.
+--   is handled automatically at nonce 1000.
 --
 --   This is a strict variant that rejects any trailing data. For
 --   streaming use cases where you need to handle multiple frames in a
