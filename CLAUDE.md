@@ -68,6 +68,8 @@ Use only minimal external dependencies. Prefer GHC's core/boot libraries
 - Never use partial Prelude functions (head, tail, !!, etc.)
 - Avoid brittle partials in tests too (e.g., unchecked indexing). Prefer
   bounds checks or total helpers even in test code.
+- Avoid non-exhaustive pattern matches and unsafe behavior; use total
+  helpers and make all constructors explicit.
 - Use Maybe/Either for fallible operations
 - Validate all inputs at system boundaries
 
