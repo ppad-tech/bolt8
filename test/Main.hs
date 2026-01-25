@@ -14,6 +14,7 @@ main = defaultMain $ testGroup "ppad-bolt8" [
     handshake_tests
   , message_tests
   , framing_tests
+  , partial_framing_tests
   , negative_tests
   ]
 
@@ -388,6 +389,109 @@ test_decrypt_frame_multi = do
                                 Right (pt2, rest2, _) -> do
                                   pt2 @?= "second"
                                   rest2 @?= BS.empty
+
+-- partial framing tests -----------------------------------------------------
+
+partial_framing_tests :: TestTree
+partial_framing_tests = testGroup "Partial Framing" [
+    testCase "short buffer returns NeedMore" test_partial_short_buffer
+  , testCase "partial body returns NeedMore" test_partial_body
+  , testCase "full frame returns FrameOk" test_partial_full_frame
+  ]
+
+test_partial_short_buffer :: Assertion
+test_partial_short_buffer = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, _) ->
+              case BOLT8.finalize r_hs msg3 of
+                Left err -> assertFailure $ "finalize failed: " ++ show err
+                Right r_result -> do
+                  let r_sess = BOLT8.session r_result
+                      short_buf = BS.replicate 10 0x00
+                  case BOLT8.decrypt_frame_partial r_sess short_buf of
+                    BOLT8.NeedMore n -> n @?= 8
+                    BOLT8.FrameOk {} ->
+                      assertFailure "expected NeedMore, got FrameOk"
+                    BOLT8.FrameError err ->
+                      assertFailure $ "expected NeedMore, got: " ++ show err
+
+test_partial_body :: Assertion
+test_partial_body = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, i_result) ->
+              case BOLT8.finalize r_hs msg3 of
+                Left err -> assertFailure $ "finalize failed: " ++ show err
+                Right r_result -> do
+                  let i_sess = BOLT8.session i_result
+                      r_sess = BOLT8.session r_result
+                  case BOLT8.encrypt i_sess hello of
+                    Left err -> assertFailure $ "encrypt failed: " ++ show err
+                    Right (ct, _) -> do
+                      -- take only length header (18 bytes) + 5 bytes of body
+                      let partial = BS.take 23 ct
+                      case BOLT8.decrypt_frame_partial r_sess partial of
+                        BOLT8.NeedMore n -> do
+                          -- "hello" = 5 bytes, so body = 5 + 16 = 21
+                          -- we have 5 bytes of body, need 16 more
+                          n @?= 16
+                        BOLT8.FrameOk {} ->
+                          assertFailure "expected NeedMore, got FrameOk"
+                        BOLT8.FrameError err ->
+                          assertFailure $ "expected NeedMore, got: " ++ show err
+
+test_partial_full_frame :: Assertion
+test_partial_full_frame = do
+  let Just (i_s_sec, i_s_pub) = BOLT8.keypair initiator_s_priv
+      Just (r_s_sec, r_s_pub) = BOLT8.keypair responder_s_priv
+      Just rs = BOLT8.parse_pub responder_s_pub
+  case BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv of
+    Left err -> assertFailure $ "act1 failed: " ++ show err
+    Right (msg1, i_hs) ->
+      case BOLT8.act2 r_s_sec r_s_pub responder_e_priv msg1 of
+        Left err -> assertFailure $ "act2 failed: " ++ show err
+        Right (msg2, r_hs) ->
+          case BOLT8.act3 i_hs msg2 of
+            Left err -> assertFailure $ "act3 failed: " ++ show err
+            Right (msg3, i_result) ->
+              case BOLT8.finalize r_hs msg3 of
+                Left err -> assertFailure $ "finalize failed: " ++ show err
+                Right r_result -> do
+                  let i_sess = BOLT8.session i_result
+                      r_sess = BOLT8.session r_result
+                  case BOLT8.encrypt i_sess hello of
+                    Left err -> assertFailure $ "encrypt failed: " ++ show err
+                    Right (ct, _) -> do
+                      let trailing = "extra"
+                          buf = ct <> trailing
+                      case BOLT8.decrypt_frame_partial r_sess buf of
+                        BOLT8.FrameOk pt remainder _ -> do
+                          pt @?= hello
+                          remainder @?= trailing
+                        BOLT8.NeedMore n ->
+                          assertFailure $ "expected FrameOk, got NeedMore "
+                            ++ show n
+                        BOLT8.FrameError err ->
+                          assertFailure $ "expected FrameOk, got: " ++ show err
 
 -- negative tests ------------------------------------------------------------
 
