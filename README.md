@@ -50,10 +50,8 @@ Haddocks are hosted at [docs.ppad.tech/bolt8][hadoc].
 
 ## Security
 
-This library aims at the maximum security achievable in a
-garbage-collected language under an optimizing compiler such as GHC.
-If you discover any vulnerabilities, please disclose them via
-security@ppad.tech.
+This is a pre-release library that, at present, claims no security
+properties whatsoever.
 
 ## Development
 
