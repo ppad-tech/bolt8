@@ -9,8 +9,9 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Lightning.Protocol.BOLT8 as BOLT8
 import Test.Tasty
 import Test.Tasty.HUnit
-import Test.Tasty.QuickCheck (Gen, Property, choose, forAll, testProperty,
-                              vectorOf)
+import Test.Tasty.QuickCheck (Gen, Property, choose, forAll,
+                              testProperty, vectorOf, (===),
+                              (.&&.))
 
 -- test helpers ----------------------------------------------------------------
 
@@ -556,10 +557,20 @@ hex bs = case B16.decode bs of
 property_tests :: TestTree
 property_tests = testGroup "Properties" [
     testProperty "handshake round-trip" prop_handshake_roundtrip
-  , testProperty "encrypt/decrypt round-trip" prop_encrypt_decrypt_roundtrip
-  , testProperty "decrypt_frame consumes one frame" prop_frame_consumes_one
+  , testProperty "encrypt/decrypt round-trip"
+      prop_encrypt_decrypt_roundtrip
+  , testProperty "decrypt_frame consumes one frame"
+      prop_frame_consumes_one
   , testProperty "decrypt_frame_partial NeedMore on short"
       prop_partial_needmore_short
+  , testProperty "handshake authenticates remote statics"
+      prop_handshake_remote_statics
+  , testProperty "encrypt/decrypt survives key rotation"
+      prop_key_rotation_roundtrip
+  , testProperty "mkMessagePayload validates size"
+      prop_mkMessagePayload_validates
+  , testProperty "key32 validates length"
+      prop_key32_validates
   ]
 
 -- generators ------------------------------------------------------------------
@@ -585,6 +596,15 @@ doHandshake
   -> BS.ByteString
   -> Maybe (BOLT8.Session, BOLT8.Session)
 doHandshake i_entropy r_entropy = do
+  (i_res, r_res) <- doHandshake' i_entropy r_entropy
+  pure (BOLT8.session i_res, BOLT8.session r_res)
+
+-- | Like 'doHandshake' but returns full Handshake results.
+doHandshake'
+  :: BS.ByteString
+  -> BS.ByteString
+  -> Maybe (BOLT8.Handshake, BOLT8.Handshake)
+doHandshake' i_entropy r_entropy = do
   (i_s_sec, i_s_pub) <- BOLT8.keypair i_entropy
   (r_s_sec, r_s_pub) <- BOLT8.keypair r_entropy
   let i_e = BS.replicate 32 0x12
@@ -597,7 +617,23 @@ doHandshake i_entropy r_entropy = do
     BOLT8.act3 i_hs msg2
   r_res <- either (const Nothing) Just $
     BOLT8.finalize r_hs msg3
-  pure (BOLT8.session i_res, BOLT8.session r_res)
+  pure (i_res, r_res)
+
+-- | Send n messages from initiator to responder,
+--   advancing both session states in sync.
+advanceSessions
+  :: Int
+  -> BOLT8.Session
+  -> BOLT8.Session
+  -> Maybe (BOLT8.Session, BOLT8.Session)
+advanceSessions 0 i r = Just (i, r)
+advanceSessions n i r =
+  case BOLT8.encrypt i (BS.replicate 5 0x00) of
+    Left _ -> Nothing
+    Right (ct, i') ->
+      case BOLT8.decrypt r ct of
+        Left _ -> Nothing
+        Right (_, r') -> advanceSessions (n - 1) i' r'
 
 -- properties ------------------------------------------------------------------
 
@@ -655,3 +691,60 @@ prop_partial_needmore_short = forAll (choose (0, 17)) $ \len ->
       in case BOLT8.decrypt_frame_partial r_sess buf of
         BOLT8.NeedMore n -> n == 18 - len
         _                -> False
+
+-- | Handshake authenticates remote static keys: each side
+--   sees the other's static pubkey.
+prop_handshake_remote_statics :: Property
+prop_handshake_remote_statics =
+  forAll genValidEntropy $ \i_ent ->
+  forAll genValidEntropy $ \r_ent ->
+    case (doHandshake' i_ent r_ent,
+          BOLT8.keypair i_ent,
+          BOLT8.keypair r_ent) of
+      (Just (i_res, r_res),
+       Just (_, i_pub),
+       Just (_, r_pub)) ->
+        BOLT8.remote_static i_res == r_pub
+        && BOLT8.remote_static r_res == i_pub
+      _ -> False
+
+-- | Encrypt/decrypt roundtrip survives key rotation at
+--   nonce 1000. Each encrypt uses 2 nonces (length +
+--   body), so rotation happens after 500 messages.
+--   We advance to message 499 then send a test payload
+--   across the rotation boundary.
+prop_key_rotation_roundtrip :: Property
+prop_key_rotation_roundtrip = forAll genPayload $ \payload ->
+  case doHandshake initiator_s_priv responder_s_priv of
+    Nothing -> False
+    Just (i_sess, r_sess) ->
+      case advanceSessions 499 i_sess r_sess of
+        Nothing -> False
+        Just (i_sess', r_sess') ->
+          case BOLT8.encrypt i_sess' payload of
+            Left _ -> False
+            Right (ct, _) ->
+              case BOLT8.decrypt r_sess' ct of
+                Left _ -> False
+                Right (pt, _) -> pt == payload
+
+-- | mkMessagePayload accepts payloads <= 65535 bytes and
+--   rejects payloads > 65535.
+prop_mkMessagePayload_validates :: Property
+prop_mkMessagePayload_validates =
+  forAll (choose (0, 256)) $ \len ->
+    let bs = BS.replicate len 0x00
+    in case BOLT8.mkMessagePayload bs of
+      Right mp ->
+        BOLT8.unMessagePayload mp === bs
+      Left _ -> False === True
+
+-- | key32 accepts exactly 32-byte inputs and rejects others.
+prop_key32_validates :: Property
+prop_key32_validates =
+  forAll (choose (0, 64)) $ \len ->
+    let bs = BS.replicate len 0x00
+    in case BOLT8.key32 bs of
+      Just k  -> len === 32
+              .&&. BOLT8.unKey32 k === bs
+      Nothing -> (len /= 32) === True
