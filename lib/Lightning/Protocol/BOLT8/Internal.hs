@@ -63,16 +63,22 @@ import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
 import qualified Crypto.Curve.Secp256k1 as Secp256k1
 import qualified Crypto.Hash.SHA256 as SHA256
 import qualified Crypto.KDF.HMAC as HKDF
-import Data.Bits (unsafeShiftR, (.&.))
+import Data.Bits (unsafeShiftR, xor, (.&.), (.|.))
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Unsafe as BU
 import Data.Word (Word16, Word64)
 import GHC.Generics (Generic)
 
 -- types -----------------------------------------------------------
 
 -- | Secret key (32 bytes).
+--
+--   The 'Eq' instance compares in constant time.
 newtype Sec = Sec BS.ByteString
-  deriving (Eq, Generic)
+  deriving Generic
+
+instance Eq Sec where
+  Sec a == Sec b = ct_eq_bs a b
 
 -- | Compressed public key.
 newtype Pub = Pub Secp256k1.Projective
@@ -87,8 +93,33 @@ instance Show Pub where
     "Pub " ++ show (Secp256k1.serialize_point p)
 
 -- | A 32-byte key, validated at construction.
+--
+--   The 'Eq' instance compares in constant time.
 newtype Key32 = Key32 { unKey32 :: BS.ByteString }
-  deriving (Eq, Generic)
+  deriving Generic
+
+instance Eq Key32 where
+  Key32 a == Key32 b = ct_eq_bs a b
+
+-- | Constant-time bytestring equality via XOR-accumulate.
+--
+--   Returns 'False' immediately on length mismatch (length is
+--   not considered secret); otherwise inspects every byte
+--   regardless of where (or whether) inputs differ.
+ct_eq_bs :: BS.ByteString -> BS.ByteString -> Bool
+ct_eq_bs a b
+  | la /= lb  = False
+  | otherwise = go 0 0
+  where
+    !la = BS.length a
+    !lb = BS.length b
+    go !i !acc
+      | i >= la   = acc == 0
+      | otherwise =
+          let !x = BU.unsafeIndex a i
+              !y = BU.unsafeIndex b i
+          in  go (i + 1) (acc .|. (x `xor` y))
+{-# NOINLINE ct_eq_bs #-}
 
 -- | Construct a 'Key32' from a 32-byte 'BS.ByteString'.
 --
