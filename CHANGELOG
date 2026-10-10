@@ -1,0 +1,33 @@
+# Changelog
+
+- 0.1.0 (UNRELEASED)
+  * Breaking: splits the post-handshake session into separate Sender
+    and Receiver states, so one state can't serve both directions and
+    a reader thread and a writer thread can each own one. Every
+    operation returns the next state; the docs now stress that reusing
+    an old state reuses a nonce (or accepts replays).
+
+  * Breaking: the local static key is a Keypair, so its secret and
+    public halves can't be mismatched, and the handshake states are
+    distinct Initiator and Responder types.
+
+  * Breaking: frames are decrypted whole with 'decrypt', or on a
+    stream with 'decrypt_header' (exactly 18 bytes) followed by
+    'decrypt_body'. 'decrypt_frame', 'decrypt_frame_partial' and
+    FrameResult are removed.
+
+  * Breaking: removes unused API (Key32, SessionNonce, MessagePayload,
+    HandshakeState, the public Sec type, the DecryptionFailed error)
+    and the exposed Internal module, renames the InvalidKey error to
+    InvalidEntropy, and drops the Generic, Show and Eq instances of
+    secret-bearing types. All public types have NFData instances.
+
+  * Fixes the key rotation docs (keys rotate every 500 messages in each
+    direction), rotates keys whenever a nonce reaches 1000 or more, and
+    requires ppad-aead >= 0.3.6 for constant-time MAC comparison.
+
+  * Tests now cover every BOLT #8 Appendix A vector, including all
+    handshake failure cases and the final keys on both sides.
+
+- 0.0.1 (2026-04-18)
+  * Initial release.
