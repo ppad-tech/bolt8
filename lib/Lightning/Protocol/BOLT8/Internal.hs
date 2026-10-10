@@ -827,7 +827,7 @@ step_nonce
   -> BS.ByteString
   -> (Word64, BS.ByteString, BS.ByteString)
 step_nonce n ck k
-  | n + 1 == 1000 =
+  | n + 1 >= 1000 =
       let !(ck', k') = mix_key ck k
       in (0, ck', k')
   | otherwise = (n + 1, ck, k)
