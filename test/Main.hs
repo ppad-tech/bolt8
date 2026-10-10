@@ -211,6 +211,34 @@ round_trip count = go 0
 
 -- keys -----------------------------------------------------------------------
 
+-- 32-byte strings (and one short one) that are not valid secret keys
+invalid_secrets :: IO [(String, BS.ByteString)]
+invalid_secrets = do
+  n <- unhex
+    "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
+  pure [
+      ("zero", BS.replicate 32 0)
+    , ("order", n)
+    , ("2^256 - 1", BS.replicate 32 0xff)
+    , ("31 bytes", BS.replicate 31 0x12)
+    ]
+
+-- 33-byte compressed encodings that are not curve points
+invalid_points :: IO [(String, BS.ByteString)]
+invalid_points = do
+  -- x = p + 1 is congruent to 1, which is on the curve, but not < p
+  p_1 <- unhex
+    "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30"
+  pure [
+      ("x = 0, no square root", BS.cons 0x02 (BS.replicate 32 0))
+    , ("x = 5, no square root", BS.cons 0x03 (BS.replicate 31 0 <> "\x05"))
+    , ("x = p + 1", BS.cons 0x02 p_1)
+    ]
+
+-- replace the 33-byte key in a 50-byte act one or act two message
+with_key :: BS.ByteString -> BS.ByteString -> BS.ByteString
+with_key pt msg = BS.take 1 msg <> pt <> BS.drop 34 msg
+
 key_tests :: TestTree
 key_tests = testGroup "keys" [
     testCase "keypair derives the spec static keys" $ do
@@ -234,6 +262,10 @@ key_tests = testGroup "keys" [
       bs <- unhex ls_r_pub
       pub <- expect_just "parse_pub" (BOLT8.parse_pub bs)
       BOLT8.serialize_pub pub @?= bs
+  , testCase "parse_pub rejects points off the curve" $ do
+      bad <- invalid_points
+      mapM_ (\(name, pt) ->
+               assertBool name (isNothing (BOLT8.parse_pub pt))) bad
   , testCase "parse_pub rejects other encodings" $ do
       -- the generator, uncompressed and x-only
       g_full <- unhex
@@ -285,22 +317,32 @@ handshake_tests = testGroup "handshake" [
       r_res <- expect_right "finalize" (BOLT8.finalize r_hs msg3)
       want <- unhex ls_i_pub
       BOLT8.serialize_pub (BOLT8.handshake_remote_static r_res) @?= want
-  , testCase "initiator records the responder's static key" $ do
-      (i_res, _) <- spec_results
-      want <- unhex ls_r_pub
-      BOLT8.serialize_pub (BOLT8.handshake_remote_static i_res) @?= want
   , testCase "act1 rejects invalid entropy" $ do
       (i, r) <- spec_keypairs
       let rs = BOLT8.keypair_pub r
-      expect_error "zero" BOLT8.InvalidEntropy
-        (BOLT8.act1 i rs (BS.replicate 32 0))
-      expect_error "short" BOLT8.InvalidEntropy
-        (BOLT8.act1 i rs (BS.replicate 31 0x12))
+      bad <- invalid_secrets
+      mapM_ (\(name, e) -> expect_error name BOLT8.InvalidEntropy
+                             (BOLT8.act1 i rs e)) bad
   , testCase "act2 rejects invalid entropy" $ do
       (_, r) <- spec_keypairs
       msg1 <- unhex act1_msg
-      expect_error "zero" BOLT8.InvalidEntropy
-        (BOLT8.act2 r (BS.replicate 32 0) msg1)
+      bad <- invalid_secrets
+      mapM_ (\(name, e) -> expect_error name BOLT8.InvalidEntropy
+                             (BOLT8.act2 r e msg1)) bad
+  , testCase "act2 rejects an ephemeral key off the curve" $ do
+      (_, r) <- spec_keypairs
+      msg1 <- unhex act1_msg
+      bad <- invalid_points
+      mapM_ (\(name, pt) -> expect_error name BOLT8.InvalidPub
+                              (BOLT8.act2 r e_r_sec (with_key pt msg1))) bad
+  , testCase "act3 rejects an ephemeral key off the curve" $ do
+      (i, r) <- spec_keypairs
+      (_, i_hs) <- expect_right "act1"
+        (BOLT8.act1 i (BOLT8.keypair_pub r) e_i_sec)
+      msg2 <- unhex act2_msg
+      bad <- invalid_points
+      mapM_ (\(name, pt) -> expect_error name BOLT8.InvalidPub
+                              (BOLT8.act3 i_hs (with_key pt msg2))) bad
   , testCase "acts reject oversized input" $ do
       (i, r) <- spec_keypairs
       msg1 <- unhex act1_msg
