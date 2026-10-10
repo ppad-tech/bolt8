@@ -77,7 +77,8 @@
 --
 -- * __Any error is fatal.__ BOLT #8 requires terminating the
 --   connection on any handshake or transport failure. Don't retry with
---   the previous state.
+--   the previous state. The one exception is 'encrypt' rejecting an
+--   oversized message, which advances nothing.
 
 module Lightning.Protocol.BOLT8 (
     -- * Keys
@@ -89,7 +90,10 @@ module Lightning.Protocol.BOLT8 (
   , serialize_pub
 
     -- * Handshake
-  , Handshake(..)
+  , Handshake
+  , handshake_sender
+  , handshake_receiver
+  , handshake_remote_static
 
     -- ** Initiator
   , Initiator
@@ -233,18 +237,38 @@ data Responder = Responder
 instance NFData Responder where
   rnf (Responder h ck k (Sec e)) = h `seq` ck `seq` k `seq` e `seq` ()
 
--- | The result of a successful handshake.
-data Handshake = Handshake {
-    handshake_sender        :: !Sender
-    -- ^ state for encrypting outgoing messages
-  , handshake_receiver      :: !Receiver
-    -- ^ state for decrypting incoming messages
-  , handshake_remote_static :: !Pub
-    -- ^ the remote party's authenticated static public key
-  }
+-- | The result of a successful handshake: the initial transport
+--   states and the remote party's authenticated static public key.
+--
+--   Take the t'Sender' and t'Receiver' out once, right after the
+--   handshake, and don't keep the t'Handshake' around: it always yields
+--   the /initial/ states, and encrypting with the initial t'Sender'
+--   a second time reuses a nonce.
+data Handshake = Handshake !Sender !Receiver !Pub
 
 instance NFData Handshake where
   rnf (Handshake s r p) = rnf s `seq` rnf r `seq` rnf p
+
+-- | The initial t'Sender', for encrypting outgoing messages.
+--
+--   Call this once per handshake. Every call returns the same initial
+--   state, so encrypting with the result of a second call reuses a
+--   nonce.
+handshake_sender :: Handshake -> Sender
+handshake_sender (Handshake s _ _) = s
+
+-- | The initial t'Receiver', for decrypting incoming messages.
+--
+--   Call this once per handshake. Every call returns the same initial
+--   state, so decrypting with the result of a second call accepts
+--   replayed frames.
+handshake_receiver :: Handshake -> Receiver
+handshake_receiver (Handshake _ r _) = r
+
+-- | The remote party's static public key, authenticated by the
+--   handshake. For the initiator, this is the key passed to 'act1'.
+handshake_remote_static :: Handshake -> Pub
+handshake_remote_static (Handshake _ _ p) = p
 
 -- transport state ------------------------------------------------------------
 
@@ -531,11 +555,8 @@ act3 (Initiator h ck e_sec (Keypair s_sec s_pub) rs) msg2 = do
       !t = encrypt_with_ad temp_k3 0 h3 BS.empty
       !(sk, rk) = mix_key ck2 BS.empty
       !msg = BS.cons 0x00 (c3 <> t)
-      !hs = Handshake {
-          handshake_sender        = Sender (Cipher sk 0 ck2)
-        , handshake_receiver      = Receiver (Cipher rk 0 ck2)
-        , handshake_remote_static = rs
-        }
+      !hs = Handshake (Sender (Cipher sk 0 ck2))
+                      (Receiver (Cipher rk 0 ck2)) rs
   pure (msg, hs)
 
 -- | Responder: process act three, completing the handshake and
@@ -563,11 +584,7 @@ finalize (Responder h ck temp_k2 e_sec) msg3 = do
   let !(ck1, temp_k3) = mix_key ck se
   _ <- note InvalidMAC (decrypt_with_ad temp_k3 0 h1 t)
   let !(rk, sk) = mix_key ck1 BS.empty
-  pure Handshake {
-      handshake_sender        = Sender (Cipher sk 0 ck1)
-    , handshake_receiver      = Receiver (Cipher rk 0 ck1)
-    , handshake_remote_static = rs
-    }
+  pure (Handshake (Sender (Cipher sk 0 ck1)) (Receiver (Cipher rk 0 ck1)) rs)
 
 -- transport ------------------------------------------------------------------
 
@@ -602,7 +619,9 @@ step (Cipher k n ck)
 --   Encrypting with the same t'Sender' twice reuses a nonce and breaks
 --   confidentiality and authenticity.
 --
---   Fails only with 'InvalidLength', for an oversized message.
+--   Fails only with 'InvalidLength', for an oversized message. Nothing
+--   is encrypted in that case, so the given t'Sender' remains the
+--   current one and the connection can continue.
 --
 --   Continuing the module-level example:
 --
