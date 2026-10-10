@@ -61,11 +61,11 @@
 --
 -- = Security
 --
--- * __Use each state exactly once.__ Every function that takes a
---   state (t'Initiator', t'Responder', t'Sender', t'Receiver' or
---   t'Pending') returns the next one, and the caller must continue with
---   that. States are ordinary immutable values, so nothing stops an old
---   one from being used again, and doing so is catastrophic: encrypting
+-- * __Use each state exactly once.__ Every function that takes an
+--   t'Initiator', t'Responder', t'Sender', t'Receiver' or t'Pending'
+--   returns the next state, and the caller must continue with that.
+--   States are ordinary immutable values, so nothing stops an old one
+--   from being used again, and doing so is catastrophic: encrypting
 --   twice with the same t'Sender' reuses a nonce, which reveals the XOR
 --   of the two plaintexts and allows forgeries, and decrypting with an
 --   old t'Receiver' accepts replayed frames.
