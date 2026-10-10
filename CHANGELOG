@@ -1,6 +1,6 @@
 # Changelog
 
-- 0.1.0 (UNRELEASED)
+- 0.1.0 (2026-10-10)
   * Breaking: splits the post-handshake session into separate Sender
     and Receiver states, so one state can't serve both directions and
     a reader thread and a writer thread can each own one. Every
