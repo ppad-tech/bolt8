@@ -7,6 +7,7 @@ import Data.Bits (xor)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Lightning.Protocol.BOLT8 as BOLT8
+import qualified Lightning.Protocol.BOLT8.Internal as I
 import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck (Gen, Property, choose, forAll,
@@ -34,6 +35,7 @@ main = defaultMain $ testGroup "ppad-bolt8" [
   , framing_tests
   , partial_framing_tests
   , negative_tests
+  , rotation_tests
   , property_tests
   ]
 
@@ -541,6 +543,45 @@ flip_byte i bs
       let (pre, post) = BS.splitAt i bs
           b = BS.index post 0
       in pure (pre <> BS.cons (b `xor` 0xff) (BS.drop 1 post))
+
+-- rotation tests ------------------------------------------------------------
+
+rotation_tests :: TestTree
+rotation_tests = testGroup "Key Rotation" [
+    testCase "send key rotates when nonce is past 1000"
+      test_rotate_past_1000_send
+  , testCase "receive key rotates when nonce is past 1000"
+      test_rotate_past_1000_recv
+  ]
+
+-- A session whose nonces are already past 1000 must still rotate on
+-- the next step rather than letting the nonce grow without bound.
+test_rotate_past_1000_send :: Assertion
+test_rotate_past_1000_send = do
+  sess <- get_initiator_session
+  let stale = sess { I.sess_sn = I.SessionNonce 1001 }
+  (_, sess') <- expectRight "encrypt" (BOLT8.encrypt stale hello)
+  I.unSessionNonce (I.sess_sn sess') @?= 1
+  assertBool "send key rotated" (I.sess_sk sess' /= I.sess_sk sess)
+  assertBool "send ck rotated" (I.sess_sck sess' /= I.sess_sck sess)
+
+test_rotate_past_1000_recv :: Assertion
+test_rotate_past_1000_recv = do
+  i_sess <- get_initiator_session
+  let i_stale = i_sess { I.sess_sn = I.SessionNonce 1001 }
+      r_stale = I.Session {
+          I.sess_sk  = I.sess_rk i_sess
+        , I.sess_sn  = I.SessionNonce 0
+        , I.sess_sck = I.sess_rck i_sess
+        , I.sess_rk  = I.sess_sk i_sess
+        , I.sess_rn  = I.SessionNonce 1001
+        , I.sess_rck = I.sess_sck i_sess
+        }
+  (ct, _) <- expectRight "encrypt" (BOLT8.encrypt i_stale hello)
+  (pt, r_sess') <- expectRight "decrypt" (BOLT8.decrypt r_stale ct)
+  pt @?= hello
+  I.unSessionNonce (I.sess_rn r_sess') @?= 1
+  assertBool "recv key rotated" (I.sess_rk r_sess' /= I.sess_rk r_stale)
 
 -- utilities -----------------------------------------------------------------
 

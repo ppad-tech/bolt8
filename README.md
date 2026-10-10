@@ -40,9 +40,11 @@ A sample GHCi session:
 
 ## Framing
 
-On a byte stream, use `decrypt_frame` when you have an exact frame, or
-`decrypt_frame_partial` to work incrementally and learn how many bytes
-are still required for the next step.
+On a byte stream, use `decrypt` when you have exactly one frame,
+`decrypt_frame` when a buffer starts with a complete frame (it returns
+the unconsumed remainder), or `decrypt_frame_partial` to work
+incrementally and learn how many bytes are still required for the next
+step.
 
 ## Documentation
 

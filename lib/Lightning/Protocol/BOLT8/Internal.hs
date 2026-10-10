@@ -704,7 +704,7 @@ decrypt sess packet = do
 --
 --   Returns the plaintext, any unconsumed bytes, and the
 --   updated session. Key rotation is handled automatically
---   every 1000 messages.
+--   every 1000 nonces (i.e. every 500 messages).
 --
 --   This is useful for streaming scenarios where multiple
 --   messages may be buffered together. The remainder can be
@@ -827,7 +827,7 @@ step_nonce
   -> BS.ByteString
   -> (Word64, BS.ByteString, BS.ByteString)
 step_nonce n ck k
-  | n + 1 == 1000 =
+  | n + 1 >= 1000 =
       let !(ck', k') = mix_key ck k
       in (0, ck', k')
   | otherwise = (n + 1, ck, k)
