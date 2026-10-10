@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               ppad-bolt8
-version:            0.0.1
+version:            0.1.0
 synopsis:           Encrypted and authenticated transport per BOLT #8
 license:            MIT
 license-file:       LICENSE
@@ -8,11 +8,13 @@ author:             Jared Tobin
 maintainer:         jared@ppad.tech
 category:           Cryptography
 build-type:         Simple
-tested-with:        GHC == 9.10.3
+tested-with:        GHC == { 9.10.3 }
 extra-doc-files:    CHANGELOG
 description:
-  Encrypted and authenticated transport, per
-  [BOLT #8](https://github.com/lightning/bolts/blob/master/08-transport.md).
+  Encrypted and authenticated transport for the Lightning Network, per
+  [BOLT #8](https://github.com/lightning/bolts/blob/master/08-transport.md):
+  the Noise_XK_secp256k1_ChaChaPoly_SHA256 handshake and message
+  transport with key rotation.
 
 source-repository head
   type:     git
