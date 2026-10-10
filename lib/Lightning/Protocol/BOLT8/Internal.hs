@@ -704,7 +704,7 @@ decrypt sess packet = do
 --
 --   Returns the plaintext, any unconsumed bytes, and the
 --   updated session. Key rotation is handled automatically
---   every 1000 messages.
+--   every 1000 nonces (i.e. every 500 messages).
 --
 --   This is useful for streaming scenarios where multiple
 --   messages may be buffered together. The remainder can be

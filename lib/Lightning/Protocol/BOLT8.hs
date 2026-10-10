@@ -46,7 +46,8 @@
 -- After a successful handshake, use 'encrypt' and 'decrypt'
 -- to exchange messages. Each returns an updated 'Session'
 -- that must be used for the next operation (keys rotate
--- every 1000 messages):
+-- every 1000 nonces, i.e. every 500 messages in each
+-- direction):
 --
 -- @
 -- -- sender
@@ -59,10 +60,12 @@
 -- = Message Framing
 --
 -- BOLT #8 runs over a byte stream, so callers often need to
--- deal with partial buffers. Use 'decrypt_frame' when you
--- have exactly one frame, or 'decrypt_frame_partial' to
--- handle incremental reads and return how many bytes are
--- still needed.
+-- deal with partial buffers. Use 'decrypt' when you have
+-- exactly one frame, 'decrypt_frame' when a buffer starts
+-- with a complete frame (it returns the unconsumed
+-- remainder), or 'decrypt_frame_partial' to handle
+-- incremental reads and return how many bytes are still
+-- needed.
 --
 -- Maximum plaintext size is 65535 bytes.
 
