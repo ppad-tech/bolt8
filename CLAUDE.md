@@ -3,11 +3,12 @@
 Haskell implementation of BOLT #8 (Lightning Network encrypted transport).
 
 Specification: https://github.com/lightning/bolts/blob/master/08-transport.md
+(implemented as of lightning/bolts@1aadb719; copy in `etc/08-transport.md`).
 
 ## Project Structure
 
-- `lib/` - library source (Lightning.Protocol.BOLT8)
-- `test/` - tests (tasty + tasty-hunit)
+- `lib/` - library source (Lightning.Protocol.BOLT8, the only module)
+- `test/` - tests (tasty, tasty-hunit, tasty-quickcheck), public API only
 - `bench/` - benchmarks (criterion for timing, weigh for allocations)
 - `flake.nix` - nix flake for dependency and build management
 - `ppad-bolt8.cabal` - cabal package definition
@@ -59,7 +60,7 @@ Use only minimal external dependencies. Prefer GHC's core/boot libraries
 ### Type safety
 
 - Encode invariants into the type system
-- Use newtypes liberally (e.g., Sec, Pub, Session)
+- Use newtypes liberally (e.g., Pub, Sender, Receiver)
 - Use ADTs to make illegal states unrepresentable
 - Prefer smart constructors that validate inputs
 
