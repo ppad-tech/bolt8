@@ -53,6 +53,8 @@ fixture = do
   (ct_64k, _) <- orFail "encrypt" (BOLT8.encrypt snd0 msg_64k)
   (_, pend_1k) <- orFail "header"
     (BOLT8.decrypt_header rcv0 (BS.take 18 ct_1k))
+  -- benchmark the success path, not MAC failure
+  mapM_ (orFail "decrypt" . BOLT8.decrypt rcv0) [ct_32, ct_1k, ct_64k]
   pure Fixture {
       fx_i = i, fx_r = r
     , fx_msg1 = msg1, fx_i_hs = i_hs
