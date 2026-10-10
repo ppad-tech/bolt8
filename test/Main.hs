@@ -1,791 +1,732 @@
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Main where
 
-import Data.Bits (xor)
+import qualified Crypto.AEAD.ChaCha20Poly1305 as AEAD
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Crypto.KDF.HMAC as HKDF
+import Data.Bits (shiftR, xor)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
+import Data.Maybe (isJust, isNothing)
+import Data.Word (Word64)
 import qualified Lightning.Protocol.BOLT8 as BOLT8
-import qualified Lightning.Protocol.BOLT8.Internal as I
 import Test.Tasty
 import Test.Tasty.HUnit
-import Test.Tasty.QuickCheck (Gen, Property, choose, forAll,
-                              testProperty, vectorOf, (===),
-                              (.&&.))
-
--- test helpers ----------------------------------------------------------------
-
--- | Extract a Just value or fail the test.
-expectJust :: String -> Maybe a -> IO a
-expectJust msg = \case
-  Nothing -> assertFailure msg >> error "unreachable"
-  Just a  -> pure a
-
--- | Extract a Right value or fail the test.
-expectRight :: Show e => String -> Either e a -> IO a
-expectRight msg = \case
-  Left e  -> assertFailure (msg ++ ": " ++ show e) >> error "unreachable"
-  Right a -> pure a
+import qualified Test.Tasty.QuickCheck as Q
 
 main :: IO ()
 main = defaultMain $ testGroup "ppad-bolt8" [
-    handshake_tests
+    key_tests
+  , handshake_tests
+  , handshake_failure_tests
   , message_tests
-  , framing_tests
-  , partial_framing_tests
-  , negative_tests
-  , rotation_tests
+  , transport_tests
+  , transport_failure_tests
   , property_tests
   ]
 
--- test vectors from BOLT #8 specification -----------------------------------
+-- helpers --------------------------------------------------------------------
 
--- initiator static private key
-initiator_s_priv :: BS.ByteString
-initiator_s_priv = hex
-  "1111111111111111111111111111111111111111111111111111111111111111"
+expect_just :: String -> Maybe a -> IO a
+expect_just msg = maybe (assertFailure msg) pure
 
--- initiator ephemeral private key
-initiator_e_priv :: BS.ByteString
-initiator_e_priv = hex
-  "1212121212121212121212121212121212121212121212121212121212121212"
+expect_right :: Show e => String -> Either e a -> IO a
+expect_right msg = either (\e -> assertFailure (msg <> ": " <> show e)) pure
 
--- responder static private key
-responder_s_priv :: BS.ByteString
-responder_s_priv = hex
-  "2121212121212121212121212121212121212121212121212121212121212121"
+-- assert failure with a specific error
+expect_error :: String -> BOLT8.Error -> Either BOLT8.Error a -> Assertion
+expect_error msg want r = case r of
+  Left got -> assertEqual msg want got
+  Right _  -> assertFailure (msg <> ": expected " <> show want)
 
--- responder static public key (known to initiator)
-responder_s_pub :: BS.ByteString
-responder_s_pub = hex
-  "028d7500dd4c12685d1f568b4c2b5048e8534b873319f3a8daa612b469132ec7f7"
+-- decode a hex literal, failing the test if it is malformed
+unhex :: BS.ByteString -> IO BS.ByteString
+unhex h = expect_just ("invalid hex: " <> show h) (B16.decode h)
 
--- responder ephemeral private key
-responder_e_priv :: BS.ByteString
-responder_e_priv = hex
-  "2222222222222222222222222222222222222222222222222222222222222222"
+-- total lookup
+at :: Int -> [a] -> Maybe a
+at i xs = case drop i xs of
+  (x : _) | i >= 0 -> Just x
+  _                -> Nothing
 
--- expected act 1 message
-expected_act1 :: BS.ByteString
-expected_act1 = hex
-  "00036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7\
-  \0df6086551151f58b8afe6c195782c6a"
-
--- expected act 2 message
-expected_act2 :: BS.ByteString
-expected_act2 = hex
-  "0002466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27\
-  \6e2470b93aac583c9ef6eafca3f730ae"
-
--- expected act 3 message
-expected_act3 :: BS.ByteString
-expected_act3 = hex
-  "00b9e3a702e93e3a9948c2ed6e5fd7590a6e1c3a0344cfc9d5b57357049aa22355\
-  \361aa02e55a8fc28fef5bd6d71ad0c38228dc68b1c466263b47fdf31e560e139ba"
-
--- handshake tests -----------------------------------------------------------
-
-handshake_tests :: TestTree
-handshake_tests = testGroup "Handshake" [
-    testCase "act1 matches spec vector" test_act1
-  , testCase "act2 matches spec vector" test_act2
-  , testCase "act3 matches spec vector" test_act3
-  , testCase "full handshake round-trip" test_full_handshake
-  ]
-
-test_act1 :: Assertion
-test_act1 = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (act1_msg, _) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                        initiator_e_priv)
-  act1_msg @?= expected_act1
-
-test_act2 :: Assertion
-test_act2 = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, _) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                    initiator_e_priv)
-  (msg2, _) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                    msg1)
-  msg2 @?= expected_act2
-
-test_act3 :: Assertion
-test_act3 = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, _) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                    msg1)
-  (msg3, _) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  msg3 @?= expected_act3
-
-test_full_handshake :: Assertion
-test_full_handshake = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, i_result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  BOLT8.remote_static i_result @?= r_s_pub
-  BOLT8.remote_static r_result @?= i_s_pub
-
--- message encryption tests --------------------------------------------------
-
-message_tests :: TestTree
-message_tests = testGroup "Message Encryption" [
-    testCase "message 0 matches spec" test_message_0
-  , testCase "message 1 matches spec" test_message_1
-  , testCase "message 500 matches spec" test_message_500
-  , testCase "message 501 matches spec" test_message_501
-  , testCase "message 1000 matches spec" test_message_1000
-  , testCase "message 1001 matches spec" test_message_1001
-  , testCase "decrypt round-trip" test_decrypt_roundtrip
-  ]
-
--- "hello" = 0x68656c6c6f
-hello :: BS.ByteString
-hello = "hello"
-
--- expected encrypted messages
-expected_msg_0 :: BS.ByteString
-expected_msg_0 = hex
-  "cf2b30ddf0cf3f80e7c35a6e6730b59fe802473180f396d88a8fb0db8cbcf25d\
-  \2f214cf9ea1d95"
-
-expected_msg_1 :: BS.ByteString
-expected_msg_1 = hex
-  "72887022101f0b6753e0c7de21657d35a4cb2a1f5cde2650528bbc8f837d0f0d\
-  \7ad833b1a256a1"
-
-expected_msg_500 :: BS.ByteString
-expected_msg_500 = hex
-  "178cb9d7387190fa34db9c2d50027d21793c9bc2d40b1e14dcf30ebeeeb220f4\
-  \8364f7a4c68bf8"
-
-expected_msg_501 :: BS.ByteString
-expected_msg_501 = hex
-  "1b186c57d44eb6de4c057c49940d79bb838a145cb528d6e8fd26dbe50a60ca2c\
-  \104b56b60e45bd"
-
-expected_msg_1000 :: BS.ByteString
-expected_msg_1000 = hex
-  "4a2f3cc3b5e78ddb83dcb426d9863d9d9a723b0337c89dd0b005d89f8d3c05c5\
-  \2b76b29b740f09"
-
-expected_msg_1001 :: BS.ByteString
-expected_msg_1001 = hex
-  "2ecd8c8a5629d0d02ab457a0fdd0f7b90a192cd46be5ecb6ca570bfc5e268338\
-  \b1a16cf4ef2d36"
-
--- helper to get initiator session after handshake
-get_initiator_session :: IO BOLT8.Session
-get_initiator_session = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, _) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                    msg1)
-  (_, result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  pure (BOLT8.session result)
-
--- encrypt N messages, return Nth ciphertext
-encrypt_n :: Int -> BOLT8.Session -> IO BS.ByteString
-encrypt_n n sess0 = go 0 sess0
-  where
-    go i sess
-      | i == n = case BOLT8.encrypt sess hello of
-          Left err -> fail $ "encrypt failed at " ++ show i ++ ": " ++ show err
-          Right (ct, _) -> pure ct
-      | otherwise = case BOLT8.encrypt sess hello of
-          Left err -> fail $ "encrypt failed at " ++ show i ++ ": " ++ show err
-          Right (_, sess') -> go (i + 1) sess'
-
-test_message_0 :: Assertion
-test_message_0 = do
-  sess <- get_initiator_session
-  ct <- encrypt_n 0 sess
-  ct @?= expected_msg_0
-
-test_message_1 :: Assertion
-test_message_1 = do
-  sess <- get_initiator_session
-  ct <- encrypt_n 1 sess
-  ct @?= expected_msg_1
-
-test_message_500 :: Assertion
-test_message_500 = do
-  sess <- get_initiator_session
-  ct <- encrypt_n 500 sess
-  ct @?= expected_msg_500
-
-test_message_501 :: Assertion
-test_message_501 = do
-  sess <- get_initiator_session
-  ct <- encrypt_n 501 sess
-  ct @?= expected_msg_501
-
-test_message_1000 :: Assertion
-test_message_1000 = do
-  sess <- get_initiator_session
-  ct <- encrypt_n 1000 sess
-  ct @?= expected_msg_1000
-
-test_message_1001 :: Assertion
-test_message_1001 = do
-  sess <- get_initiator_session
-  ct <- encrypt_n 1001 sess
-  ct @?= expected_msg_1001
-
-test_decrypt_roundtrip :: Assertion
-test_decrypt_roundtrip = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, i_result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let i_sess = BOLT8.session i_result
-      r_sess = BOLT8.session r_result
-  (ct, _) <- expectRight "encrypt" (BOLT8.encrypt i_sess hello)
-  (pt, _) <- expectRight "decrypt" (BOLT8.decrypt r_sess ct)
-  pt @?= hello
-
--- framing tests -------------------------------------------------------------
-
-framing_tests :: TestTree
-framing_tests = testGroup "Packet Framing" [
-    testCase "decrypt rejects trailing bytes" test_decrypt_trailing
-  , testCase "decrypt_frame returns remainder" test_decrypt_frame_remainder
-  , testCase "decrypt_frame handles multiple frames" test_decrypt_frame_multi
-  ]
-
-test_decrypt_trailing :: Assertion
-test_decrypt_trailing = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, i_result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let i_sess = BOLT8.session i_result
-      r_sess = BOLT8.session r_result
-  (ct, _) <- expectRight "encrypt" (BOLT8.encrypt i_sess hello)
-  -- append trailing bytes
-  let ct_with_trailing = ct <> "extra"
-  case BOLT8.decrypt r_sess ct_with_trailing of
-    Left BOLT8.InvalidLength -> pure ()
-    Left err -> assertFailure $ "expected InvalidLength, got: " ++ show err
-    Right _ -> assertFailure "decrypt should reject trailing bytes"
-
-test_decrypt_frame_remainder :: Assertion
-test_decrypt_frame_remainder = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, i_result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let i_sess = BOLT8.session i_result
-      r_sess = BOLT8.session r_result
-  (ct, _) <- expectRight "encrypt" (BOLT8.encrypt i_sess hello)
-  let trailing = "remainder"
-      ct_with_trailing = ct <> trailing
-  (pt, remainder, _) <- expectRight "decrypt_frame"
-                          (BOLT8.decrypt_frame r_sess ct_with_trailing)
-  pt @?= hello
-  remainder @?= trailing
-
-test_decrypt_frame_multi :: Assertion
-test_decrypt_frame_multi = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, i_result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let i_sess = BOLT8.session i_result
-      r_sess = BOLT8.session r_result
-  -- encrypt two messages
-  (ct1, i_sess') <- expectRight "encrypt 1" (BOLT8.encrypt i_sess "first")
-  (ct2, _) <- expectRight "encrypt 2" (BOLT8.encrypt i_sess' "second")
-  -- concatenate frames
-  let buffer = ct1 <> ct2
-  -- decrypt first frame
-  (pt1, rest, r_sess') <- expectRight "frame 1"
-                            (BOLT8.decrypt_frame r_sess buffer)
-  pt1 @?= "first"
-  -- decrypt second frame from remainder
-  (pt2, rest2, _) <- expectRight "frame 2" (BOLT8.decrypt_frame r_sess' rest)
-  pt2 @?= "second"
-  rest2 @?= BS.empty
-
--- partial framing tests -----------------------------------------------------
-
-partial_framing_tests :: TestTree
-partial_framing_tests = testGroup "Partial Framing" [
-    testCase "short buffer returns NeedMore" test_partial_short_buffer
-  , testCase "partial body returns NeedMore" test_partial_body
-  , testCase "full frame returns FrameOk" test_partial_full_frame
-  ]
-
-test_partial_short_buffer :: Assertion
-test_partial_short_buffer = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, _) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let r_sess = BOLT8.session r_result
-      short_buf = BS.replicate 10 0x00
-  case BOLT8.decrypt_frame_partial r_sess short_buf of
-    BOLT8.NeedMore n -> n @?= 8
-    BOLT8.FrameOk {} -> assertFailure "expected NeedMore, got FrameOk"
-    BOLT8.FrameError err ->
-      assertFailure $ "expected NeedMore, got: " ++ show err
-
-test_partial_body :: Assertion
-test_partial_body = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, i_result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let i_sess = BOLT8.session i_result
-      r_sess = BOLT8.session r_result
-  (ct, _) <- expectRight "encrypt" (BOLT8.encrypt i_sess hello)
-  -- take only length header (18 bytes) + 5 bytes of body
-  let partial = BS.take 23 ct
-  case BOLT8.decrypt_frame_partial r_sess partial of
-    BOLT8.NeedMore n -> do
-      -- "hello" = 5 bytes, so body = 5 + 16 = 21
-      -- we have 5 bytes of body, need 16 more
-      n @?= 16
-    BOLT8.FrameOk {} -> assertFailure "expected NeedMore, got FrameOk"
-    BOLT8.FrameError err ->
-      assertFailure $ "expected NeedMore, got: " ++ show err
-
-test_partial_full_frame :: Assertion
-test_partial_full_frame = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, i_result) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let i_sess = BOLT8.session i_result
-      r_sess = BOLT8.session r_result
-  (ct, _) <- expectRight "encrypt" (BOLT8.encrypt i_sess hello)
-  let trailing = "extra"
-      buf = ct <> trailing
-  case BOLT8.decrypt_frame_partial r_sess buf of
-    BOLT8.FrameOk pt remainder _ -> do
-      pt @?= hello
-      remainder @?= trailing
-    BOLT8.NeedMore n ->
-      assertFailure $ "expected FrameOk, got NeedMore " ++ show n
-    BOLT8.FrameError err ->
-      assertFailure $ "expected FrameOk, got: " ++ show err
-
--- negative tests ------------------------------------------------------------
-
-negative_tests :: TestTree
-negative_tests = testGroup "Negative Tests" [
-    testCase "act2 rejects wrong version" test_act2_wrong_version
-  , testCase "act2 rejects wrong length" test_act2_wrong_length
-  , testCase "act3 rejects invalid MAC" test_act3_invalid_mac
-  , testCase "finalize rejects invalid MAC" test_finalize_invalid_mac
-  , testCase "decrypt rejects short packet" test_decrypt_short_packet
-  ]
-
-test_act2_wrong_version :: Assertion
-test_act2_wrong_version = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, _) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs initiator_e_priv)
-  let bad_msg1 = BS.cons 0x01 (BS.drop 1 msg1)
-  case BOLT8.act2 r_s_sec r_s_pub responder_e_priv bad_msg1 of
-    Left BOLT8.InvalidVersion -> pure ()
-    Left err -> assertFailure $ "expected InvalidVersion, got: " ++ show err
-    Right _ -> assertFailure "expected rejection, got success"
-
-test_act2_wrong_length :: Assertion
-test_act2_wrong_length = do
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  let short_msg = BS.replicate 49 0x00
-  case BOLT8.act2 r_s_sec r_s_pub responder_e_priv short_msg of
-    Left BOLT8.InvalidLength -> pure ()
-    Left err -> assertFailure $ "expected InvalidLength, got: " ++ show err
-    Right _ -> assertFailure "expected rejection, got success"
-
-test_act3_invalid_mac :: Assertion
-test_act3_invalid_mac = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, _) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                    msg1)
-  bad_msg2 <- flip_byte 40 msg2
-  case BOLT8.act3 i_hs bad_msg2 of
-    Left BOLT8.InvalidMAC -> pure ()
-    Left err -> assertFailure $ "expected InvalidMAC, got: " ++ show err
-    Right _ -> assertFailure "expected rejection, got success"
-
-test_finalize_invalid_mac :: Assertion
-test_finalize_invalid_mac = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, _) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  bad_msg3 <- flip_byte 20 msg3
-  case BOLT8.finalize r_hs bad_msg3 of
-    Left BOLT8.InvalidMAC -> pure ()
-    Left err -> assertFailure $ "expected InvalidMAC, got: " ++ show err
-    Right _ -> assertFailure "expected rejection, got success"
-
-test_decrypt_short_packet :: Assertion
-test_decrypt_short_packet = do
-  (i_s_sec, i_s_pub) <- expectJust "initiator keypair"
-                          (BOLT8.keypair initiator_s_priv)
-  (r_s_sec, r_s_pub) <- expectJust "responder keypair"
-                          (BOLT8.keypair responder_s_priv)
-  rs <- expectJust "responder pub" (BOLT8.parse_pub responder_s_pub)
-  (msg1, i_hs) <- expectRight "act1" (BOLT8.act1 i_s_sec i_s_pub rs
-                                       initiator_e_priv)
-  (msg2, r_hs) <- expectRight "act2" (BOLT8.act2 r_s_sec r_s_pub responder_e_priv
-                                       msg1)
-  (msg3, _) <- expectRight "act3" (BOLT8.act3 i_hs msg2)
-  r_result <- expectRight "finalize" (BOLT8.finalize r_hs msg3)
-  let r_sess = BOLT8.session r_result
-      short_packet = BS.replicate 17 0x00
-  case BOLT8.decrypt r_sess short_packet of
-    Left BOLT8.InvalidLength -> pure ()
-    Left err -> assertFailure $ "expected InvalidLength, got: " ++ show err
-    Right _ -> assertFailure "expected rejection, got success"
-
--- flip one byte in a bytestring at given index
+-- flip all bits of the byte at the given index
 flip_byte :: Int -> BS.ByteString -> IO BS.ByteString
 flip_byte i bs
   | i < 0 || i >= BS.length bs =
-      assertFailure "flip_byte: index out of bounds" >> pure bs
+      assertFailure ("flip_byte: index out of bounds: " <> show i)
   | otherwise =
       let (pre, post) = BS.splitAt i bs
-          b = BS.index post 0
-      in pure (pre <> BS.cons (b `xor` 0xff) (BS.drop 1 post))
+      in  pure (pre <> BS.map (xor 0xff) (BS.take 1 post) <> BS.drop 1 post)
 
--- rotation tests ------------------------------------------------------------
+-- payload for the m'th message of a test stream
+payload :: Int -> BS.ByteString
+payload m = BS.replicate (m `mod` 7) (fromIntegral m)
 
-rotation_tests :: TestTree
-rotation_tests = testGroup "Key Rotation" [
-    testCase "send key rotates when nonce is past 1000"
-      test_rotate_past_1000_send
-  , testCase "receive key rotates when nonce is past 1000"
-      test_rotate_past_1000_recv
-  ]
+-- Appendix A key material ----------------------------------------------------
 
--- A session whose nonces are already past 1000 must still rotate on
--- the next step rather than letting the nonce grow without bound.
-test_rotate_past_1000_send :: Assertion
-test_rotate_past_1000_send = do
-  sess <- get_initiator_session
-  let stale = sess { I.sess_sn = I.SessionNonce 1001 }
-  (_, sess') <- expectRight "encrypt" (BOLT8.encrypt stale hello)
-  I.unSessionNonce (I.sess_sn sess') @?= 1
-  assertBool "send key rotated" (I.sess_sk sess' /= I.sess_sk sess)
-  assertBool "send ck rotated" (I.sess_sck sess' /= I.sess_sck sess)
+ls_i_sec, e_i_sec, ls_r_sec, e_r_sec :: BS.ByteString
+ls_i_sec = BS.replicate 32 0x11
+e_i_sec  = BS.replicate 32 0x12
+ls_r_sec = BS.replicate 32 0x21
+e_r_sec  = BS.replicate 32 0x22
 
-test_rotate_past_1000_recv :: Assertion
-test_rotate_past_1000_recv = do
-  i_sess <- get_initiator_session
-  let i_stale = i_sess { I.sess_sn = I.SessionNonce 1001 }
-      r_stale = I.Session {
-          I.sess_sk  = I.sess_rk i_sess
-        , I.sess_sn  = I.SessionNonce 0
-        , I.sess_sck = I.sess_rck i_sess
-        , I.sess_rk  = I.sess_sk i_sess
-        , I.sess_rn  = I.SessionNonce 1001
-        , I.sess_rck = I.sess_sck i_sess
-        }
-  (ct, _) <- expectRight "encrypt" (BOLT8.encrypt i_stale hello)
-  (pt, r_sess') <- expectRight "decrypt" (BOLT8.decrypt r_stale ct)
-  pt @?= hello
-  I.unSessionNonce (I.sess_rn r_sess') @?= 1
-  assertBool "recv key rotated" (I.sess_rk r_sess' /= I.sess_rk r_stale)
+ls_i_pub, ls_r_pub, e_i_pub, e_r_pub :: BS.ByteString
+ls_i_pub =
+  "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa"
+ls_r_pub =
+  "028d7500dd4c12685d1f568b4c2b5048e8534b873319f3a8daa612b469132ec7f7"
+e_i_pub =
+  "036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7"
+e_r_pub =
+  "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27"
 
--- utilities -----------------------------------------------------------------
+act1_msg, act2_msg, act3_msg :: BS.ByteString
+act1_msg =
+  "00036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7\
+  \0df6086551151f58b8afe6c195782c6a"
+act2_msg =
+  "0002466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27\
+  \6e2470b93aac583c9ef6eafca3f730ae"
+act3_msg =
+  "00b9e3a702e93e3a9948c2ed6e5fd7590a6e1c3a0344cfc9d5b57357049aa22355\
+  \361aa02e55a8fc28fef5bd6d71ad0c38228dc68b1c466263b47fdf31e560e139ba"
 
--- Safe hex decode for test vectors (only called at top level with known-good
--- literals). This uses error since it's for compile-time constants, not runtime
--- input; wrapping in IO would break the test vector declarations.
-hex :: BS.ByteString -> BS.ByteString
-hex bs = case B16.decode bs of
-  Nothing -> error "hex: invalid test vector literal"
-  Just r  -> r
+-- final chaining key, and the initiator's sending and receiving keys
+-- (the responder's are swapped)
+final_ck, final_sk, final_rk :: BS.ByteString
+final_ck =
+  "919219dbb2920afa8db80f9a51787a840bcf111ed8d588caf9ab4be716e42b01"
+final_sk =
+  "969ab31b4d288cedf6218839b27a3e2140827047f2c0f01bf5c04435d43511a9"
+final_rk =
+  "bb9020b8965f4df047e07f955f3c4b88418984aadc5cdb35096b9ea8fa5c3442"
 
--- property tests --------------------------------------------------------------
+spec_keypairs :: IO (BOLT8.Keypair, BOLT8.Keypair)
+spec_keypairs = do
+  i <- expect_just "initiator keypair" (BOLT8.keypair ls_i_sec)
+  r <- expect_just "responder keypair" (BOLT8.keypair ls_r_sec)
+  pure (i, r)
 
-property_tests :: TestTree
-property_tests = testGroup "Properties" [
-    testProperty "handshake round-trip" prop_handshake_roundtrip
-  , testProperty "encrypt/decrypt round-trip"
-      prop_encrypt_decrypt_roundtrip
-  , testProperty "decrypt_frame consumes one frame"
-      prop_frame_consumes_one
-  , testProperty "decrypt_frame_partial NeedMore on short"
-      prop_partial_needmore_short
-  , testProperty "handshake authenticates remote statics"
-      prop_handshake_remote_statics
-  , testProperty "encrypt/decrypt survives key rotation"
-      prop_key_rotation_roundtrip
-  , testProperty "mkMessagePayload validates size"
-      prop_mkMessagePayload_validates
-  , testProperty "key32 validates length"
-      prop_key32_validates
-  ]
+-- the Appendix A handshake, as (initiator, responder) results
+spec_handshake :: Either BOLT8.Error (BOLT8.Handshake, BOLT8.Handshake)
+spec_handshake = do
+  i <- maybe (Left BOLT8.InvalidEntropy) Right (BOLT8.keypair ls_i_sec)
+  r <- maybe (Left BOLT8.InvalidEntropy) Right (BOLT8.keypair ls_r_sec)
+  handshake i r e_i_sec e_r_sec
 
--- generators ------------------------------------------------------------------
+spec_results :: IO (BOLT8.Handshake, BOLT8.Handshake)
+spec_results = expect_right "spec handshake" spec_handshake
 
--- | Generate 32 bytes of entropy that yields a valid keypair.
-genValidEntropy :: Gen BS.ByteString
-genValidEntropy = do
-  bytes <- BS.pack <$> vectorOf 32 (choose (0, 255))
-  case BOLT8.keypair bytes of
-    Just _  -> pure bytes
-    Nothing -> genValidEntropy
-
--- | Generate a payload of 0..256 bytes.
-genPayload :: Gen BS.ByteString
-genPayload = do
-  len <- choose (0, 256)
-  BS.pack <$> vectorOf len (choose (0, 255))
-
--- | Perform a full handshake with given static key entropy.
--- Uses fixed ephemeral keys for determinism.
-doHandshake
-  :: BS.ByteString
+handshake
+  :: BOLT8.Keypair
+  -> BOLT8.Keypair
   -> BS.ByteString
-  -> Maybe (BOLT8.Session, BOLT8.Session)
-doHandshake i_entropy r_entropy = do
-  (i_res, r_res) <- doHandshake' i_entropy r_entropy
-  pure (BOLT8.session i_res, BOLT8.session r_res)
-
--- | Like 'doHandshake' but returns full Handshake results.
-doHandshake'
-  :: BS.ByteString
   -> BS.ByteString
-  -> Maybe (BOLT8.Handshake, BOLT8.Handshake)
-doHandshake' i_entropy r_entropy = do
-  (i_s_sec, i_s_pub) <- BOLT8.keypair i_entropy
-  (r_s_sec, r_s_pub) <- BOLT8.keypair r_entropy
-  let i_e = BS.replicate 32 0x12
-      r_e = BS.replicate 32 0x22
-  (msg1, i_hs) <- either (const Nothing) Just $
-    BOLT8.act1 i_s_sec i_s_pub r_s_pub i_e
-  (msg2, r_hs) <- either (const Nothing) Just $
-    BOLT8.act2 r_s_sec r_s_pub r_e msg1
-  (msg3, i_res) <- either (const Nothing) Just $
-    BOLT8.act3 i_hs msg2
-  r_res <- either (const Nothing) Just $
-    BOLT8.finalize r_hs msg3
+  -> Either BOLT8.Error (BOLT8.Handshake, BOLT8.Handshake)
+handshake i r i_e r_e = do
+  (msg1, i_hs) <- BOLT8.act1 i (BOLT8.keypair_pub r) i_e
+  (msg2, r_hs) <- BOLT8.act2 r r_e msg1
+  (msg3, i_res) <- BOLT8.act3 i_hs msg2
+  r_res <- BOLT8.finalize r_hs msg3
   pure (i_res, r_res)
 
--- | Send n messages from initiator to responder,
---   advancing both session states in sync.
-advanceSessions
-  :: Int
-  -> BOLT8.Session
-  -> BOLT8.Session
-  -> Maybe (BOLT8.Session, BOLT8.Session)
-advanceSessions 0 i r = Just (i, r)
-advanceSessions n i r =
-  case BOLT8.encrypt i (BS.replicate 5 0x00) of
-    Left _ -> Nothing
-    Right (ct, i') ->
-      case BOLT8.decrypt r ct of
-        Left _ -> Nothing
-        Right (_, r') -> advanceSessions (n - 1) i' r'
+-- reference transport --------------------------------------------------------
 
--- properties ------------------------------------------------------------------
+-- BOLT #8 framing and rotation built directly on ppad-aead and
+-- ppad-hkdf, as an independent check of the library's key schedule.
 
--- | Handshake succeeds for valid keys and sessions are consistent.
-prop_handshake_roundtrip :: Property
-prop_handshake_roundtrip = forAll genValidEntropy $ \i_ent ->
-  forAll genValidEntropy $ \r_ent ->
-    case doHandshake i_ent r_ent of
-      Nothing -> False
-      Just _  -> True
+ref_nonce :: Word64 -> BS.ByteString
+ref_nonce n = BS.replicate 4 0 <>
+  BS.pack [fromIntegral (n `shiftR` (8 * j)) | j <- [0 .. 7]]
 
--- | Encrypt then decrypt yields original payload.
-prop_encrypt_decrypt_roundtrip :: Property
-prop_encrypt_decrypt_roundtrip = forAll genPayload $ \payload ->
-  case doHandshake initiator_s_priv responder_s_priv of
-    Nothing -> False
-    Just (i_sess, r_sess) ->
-      case BOLT8.encrypt i_sess payload of
-        Left _ -> False
-        Right (ct, _) ->
-          case BOLT8.decrypt r_sess ct of
-            Left _ -> False
-            Right (pt, _) -> pt == payload
+ref_frame :: BS.ByteString -> Word64 -> BS.ByteString -> IO BS.ByteString
+ref_frame k n m = do
+  let len = BS.length m
+      l = BS.pack [fromIntegral (len `shiftR` 8), fromIntegral len]
+  (lc, lt) <- expect_right "aead" (AEAD.encrypt mempty k (ref_nonce n) l)
+  (c, t) <- expect_right "aead" (AEAD.encrypt mempty k (ref_nonce (n + 1)) m)
+  pure (lc <> lt <> c <> t)
 
--- | decrypt_frame consumes exactly one frame and returns remainder.
-prop_frame_consumes_one :: Property
-prop_frame_consumes_one = forAll genPayload $ \p1 ->
-  forAll genPayload $ \p2 ->
-    case doHandshake initiator_s_priv responder_s_priv of
-      Nothing -> False
-      Just (i_sess, r_sess) ->
-        case BOLT8.encrypt i_sess p1 of
-          Left _ -> False
-          Right (ct1, i_sess') ->
-            case BOLT8.encrypt i_sess' p2 of
-              Left _ -> False
-              Right (ct2, _) ->
-                let buf = ct1 <> ct2
-                in case BOLT8.decrypt_frame r_sess buf of
-                  Left _ -> False
-                  Right (pt1, rest, r_sess') ->
-                    pt1 == p1 &&
-                    case BOLT8.decrypt_frame r_sess' rest of
-                      Left _ -> False
-                      Right (pt2, rest2, _) ->
-                        pt2 == p2 && BS.null rest2
+-- (ck', k') = HKDF(ck, k)
+ref_rotate
+  :: BS.ByteString -> BS.ByteString -> IO (BS.ByteString, BS.ByteString)
+ref_rotate ck k = do
+  out <- expect_just "hkdf" (HKDF.derive hmac ck mempty 64 k)
+  pure (BS.splitAt 32 out)
+  where
+    hmac a b = case SHA256.hmac a b of SHA256.MAC mac -> mac
 
--- | decrypt_frame_partial returns NeedMore when buffer < 18 bytes.
-prop_partial_needmore_short :: Property
-prop_partial_needmore_short = forAll (choose (0, 17)) $ \len ->
-  case doHandshake initiator_s_priv responder_s_priv of
-    Nothing -> False
-    Just (_, r_sess) ->
-      let buf = BS.replicate len 0x00
-      in case BOLT8.decrypt_frame_partial r_sess buf of
-        BOLT8.NeedMore n -> n == 18 - len
-        _                -> False
+-- frames carrying 'payload' 0 .. count - 1, sent under key k and
+-- chaining key ck
+ref_stream :: BS.ByteString -> BS.ByteString -> Int -> IO [BS.ByteString]
+ref_stream = go 0 0
+  where
+    go m n ck k count
+      | m == count = pure []
+      | n >= 1000 = do
+          (ck', k') <- ref_rotate ck k
+          go m 0 ck' k' count
+      | otherwise = do
+          f <- ref_frame k n (payload m)
+          fs <- go (m + 1) (n + 2) ck k count
+          pure (f : fs)
 
--- | Handshake authenticates remote static keys: each side
---   sees the other's static pubkey.
-prop_handshake_remote_statics :: Property
-prop_handshake_remote_statics =
-  forAll genValidEntropy $ \i_ent ->
-  forAll genValidEntropy $ \r_ent ->
-    case (doHandshake' i_ent r_ent,
-          BOLT8.keypair i_ent,
-          BOLT8.keypair r_ent) of
-      (Just (i_res, r_res),
-       Just (_, i_pub),
-       Just (_, r_pub)) ->
-        BOLT8.remote_static i_res == r_pub
-        && BOLT8.remote_static r_res == i_pub
-      _ -> False
+-- assert that a Sender encrypts under key k with chaining key ck,
+-- across two rotations
+check_sender :: BS.ByteString -> BS.ByteString -> BOLT8.Sender -> Assertion
+check_sender ck k s0 = do
+  ref <- ref_stream ck k 1002
+  let go _ _ [] = pure ()
+      go m s (f : fs) = do
+        (ct, s') <- expect_right "encrypt" (BOLT8.encrypt s (payload m))
+        assertEqual ("frame " <> show m) f ct
+        go (m + 1) s' fs
+  go (0 :: Int) s0 ref
 
--- | Encrypt/decrypt roundtrip survives key rotation at
---   nonce 1000. Each encrypt uses 2 nonces (length +
---   body), so rotation happens after 500 messages.
---   We advance to message 499 then send a test payload
---   across the rotation boundary.
-prop_key_rotation_roundtrip :: Property
-prop_key_rotation_roundtrip = forAll genPayload $ \payload ->
-  case doHandshake initiator_s_priv responder_s_priv of
-    Nothing -> False
-    Just (i_sess, r_sess) ->
-      case advanceSessions 499 i_sess r_sess of
-        Nothing -> False
-        Just (i_sess', r_sess') ->
-          case BOLT8.encrypt i_sess' payload of
-            Left _ -> False
-            Right (ct, _) ->
-              case BOLT8.decrypt r_sess' ct of
-                Left _ -> False
-                Right (pt, _) -> pt == payload
+-- assert that a Receiver decrypts under key k with chaining key ck,
+-- across two rotations
+check_receiver
+  :: BS.ByteString -> BS.ByteString -> BOLT8.Receiver -> Assertion
+check_receiver ck k r0 = do
+  ref <- ref_stream ck k 1002
+  let go _ _ [] = pure ()
+      go m r (f : fs) = do
+        (pt, r') <- expect_right ("decrypt " <> show m) (BOLT8.decrypt r f)
+        assertEqual ("message " <> show m) (payload m) pt
+        go (m + 1) r' fs
+  go (0 :: Int) r0 ref
 
--- | mkMessagePayload accepts payloads <= 65535 bytes and
---   rejects payloads > 65535.
-prop_mkMessagePayload_validates :: Property
-prop_mkMessagePayload_validates =
-  forAll (choose (0, 256)) $ \len ->
-    let bs = BS.replicate len 0x00
-    in case BOLT8.mkMessagePayload bs of
-      Right mp ->
-        BOLT8.unMessagePayload mp === bs
-      Left _ -> False === True
+-- send 'payload' 0 .. count - 1 from a Sender to a Receiver
+round_trip :: Int -> BOLT8.Sender -> BOLT8.Receiver -> Assertion
+round_trip count = go 0
+  where
+    go m s r
+      | m == count = pure ()
+      | otherwise = do
+          (ct, s') <- expect_right "encrypt" (BOLT8.encrypt s (payload m))
+          (pt, r') <- expect_right ("decrypt " <> show m) (BOLT8.decrypt r ct)
+          assertEqual ("message " <> show m) (payload m) pt
+          go (m + 1) s' r'
 
--- | key32 accepts exactly 32-byte inputs and rejects others.
-prop_key32_validates :: Property
-prop_key32_validates =
-  forAll (choose (0, 64)) $ \len ->
-    let bs = BS.replicate len 0x00
-    in case BOLT8.key32 bs of
-      Just k  -> len === 32
-              .&&. BOLT8.unKey32 k === bs
-      Nothing -> (len /= 32) === True
+-- keys -----------------------------------------------------------------------
+
+key_tests :: TestTree
+key_tests = testGroup "keys" [
+    testCase "keypair derives the spec static keys" $ do
+      (i, r) <- spec_keypairs
+      want_i <- unhex ls_i_pub
+      want_r <- unhex ls_r_pub
+      BOLT8.serialize_pub (BOLT8.keypair_pub i) @?= want_i
+      BOLT8.serialize_pub (BOLT8.keypair_pub r) @?= want_r
+  , testCase "keypair rejects invalid secrets" $ do
+      n <- unhex
+        "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
+      n_1 <- unhex
+        "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140"
+      assertBool "31 bytes" (isNothing (BOLT8.keypair (BS.replicate 31 1)))
+      assertBool "33 bytes" (isNothing (BOLT8.keypair (BS.replicate 33 1)))
+      assertBool "zero" (isNothing (BOLT8.keypair (BS.replicate 32 0)))
+      assertBool "order" (isNothing (BOLT8.keypair n))
+      assertBool "2^256 - 1" (isNothing (BOLT8.keypair (BS.replicate 32 0xff)))
+      assertBool "order - 1" (isJust (BOLT8.keypair n_1))
+  , testCase "parse_pub round-trips compressed keys" $ do
+      bs <- unhex ls_r_pub
+      pub <- expect_just "parse_pub" (BOLT8.parse_pub bs)
+      BOLT8.serialize_pub pub @?= bs
+  , testCase "parse_pub rejects other encodings" $ do
+      -- the generator, uncompressed and x-only
+      g_full <- unhex
+        "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+        \483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
+      g_x <- unhex
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+      bs <- unhex ls_r_pub
+      assertBool "uncompressed" (isNothing (BOLT8.parse_pub g_full))
+      assertBool "x-only" (isNothing (BOLT8.parse_pub g_x))
+      assertBool "0x04 prefix"
+        (isNothing (BOLT8.parse_pub (BS.cons 0x04 (BS.drop 1 bs))))
+      assertBool "34 bytes" (isNothing (BOLT8.parse_pub (bs <> "\x00")))
+  ]
+
+-- handshake ------------------------------------------------------------------
+
+handshake_tests :: TestTree
+handshake_tests = testGroup "handshake" [
+    testCase "act one matches spec" $ do
+      (i, _) <- spec_keypairs
+      rs <- unhex ls_r_pub >>= expect_just "rs" . BOLT8.parse_pub
+      (msg1, _) <- expect_right "act1" (BOLT8.act1 i rs e_i_sec)
+      want <- unhex act1_msg
+      e <- unhex e_i_pub
+      msg1 @?= want
+      BS.take 33 (BS.drop 1 msg1) @?= e
+  , testCase "act two matches spec" $ do
+      (_, r) <- spec_keypairs
+      msg1 <- unhex act1_msg
+      (msg2, _) <- expect_right "act2" (BOLT8.act2 r e_r_sec msg1)
+      want <- unhex act2_msg
+      e <- unhex e_r_pub
+      msg2 @?= want
+      BS.take 33 (BS.drop 1 msg2) @?= e
+  , testCase "act three matches spec" $ do
+      (i, r) <- spec_keypairs
+      (_, i_hs) <- expect_right "act1"
+        (BOLT8.act1 i (BOLT8.keypair_pub r) e_i_sec)
+      msg2 <- unhex act2_msg
+      (msg3, _) <- expect_right "act3" (BOLT8.act3 i_hs msg2)
+      want <- unhex act3_msg
+      msg3 @?= want
+  , testCase "finalize accepts spec act three" $ do
+      (_, r) <- spec_keypairs
+      msg1 <- unhex act1_msg
+      msg3 <- unhex act3_msg
+      (_, r_hs) <- expect_right "act2" (BOLT8.act2 r e_r_sec msg1)
+      r_res <- expect_right "finalize" (BOLT8.finalize r_hs msg3)
+      want <- unhex ls_i_pub
+      BOLT8.serialize_pub (BOLT8.handshake_remote_static r_res) @?= want
+  , testCase "initiator records the responder's static key" $ do
+      (i_res, _) <- spec_results
+      want <- unhex ls_r_pub
+      BOLT8.serialize_pub (BOLT8.handshake_remote_static i_res) @?= want
+  , testCase "act1 rejects invalid entropy" $ do
+      (i, r) <- spec_keypairs
+      let rs = BOLT8.keypair_pub r
+      expect_error "zero" BOLT8.InvalidEntropy
+        (BOLT8.act1 i rs (BS.replicate 32 0))
+      expect_error "short" BOLT8.InvalidEntropy
+        (BOLT8.act1 i rs (BS.replicate 31 0x12))
+  , testCase "act2 rejects invalid entropy" $ do
+      (_, r) <- spec_keypairs
+      msg1 <- unhex act1_msg
+      expect_error "zero" BOLT8.InvalidEntropy
+        (BOLT8.act2 r (BS.replicate 32 0) msg1)
+  , testCase "acts reject oversized input" $ do
+      (i, r) <- spec_keypairs
+      msg1 <- unhex act1_msg
+      msg2 <- unhex act2_msg
+      msg3 <- unhex act3_msg
+      (_, i_hs) <- expect_right "act1"
+        (BOLT8.act1 i (BOLT8.keypair_pub r) e_i_sec)
+      (_, r_hs) <- expect_right "act2" (BOLT8.act2 r e_r_sec msg1)
+      expect_error "act2" BOLT8.InvalidLength
+        (BOLT8.act2 r e_r_sec (msg1 <> "\x00"))
+      expect_error "act3" BOLT8.InvalidLength
+        (BOLT8.act3 i_hs (msg2 <> "\x00"))
+      expect_error "finalize" BOLT8.InvalidLength
+        (BOLT8.finalize r_hs (msg3 <> "\x00"))
+  ]
+
+-- Appendix A failure vectors -------------------------------------------------
+
+data Failure = Failure String BS.ByteString BOLT8.Error
+
+handshake_failure_tests :: TestTree
+handshake_failure_tests = testGroup "Appendix A failure vectors" [
+    testGroup "initiator, act two" (fmap initiator_failure act2_failures)
+  , testGroup "responder, act one" (fmap act1_failure act1_failures)
+  , testGroup "responder, act three" (fmap act3_failure act3_failures)
+  ]
+
+initiator_failure :: Failure -> TestTree
+initiator_failure (Failure name input want) = testCase name $ do
+  (i, _) <- spec_keypairs
+  rs <- unhex ls_r_pub >>= expect_just "rs" . BOLT8.parse_pub
+  (msg1, i_hs) <- expect_right "act1" (BOLT8.act1 i rs e_i_sec)
+  unhex act1_msg >>= (msg1 @?=)
+  msg2 <- unhex input
+  expect_error name want (BOLT8.act3 i_hs msg2)
+
+act1_failure :: Failure -> TestTree
+act1_failure (Failure name input want) = testCase name $ do
+  (_, r) <- spec_keypairs
+  msg1 <- unhex input
+  expect_error name want (BOLT8.act2 r e_r_sec msg1)
+
+act3_failure :: Failure -> TestTree
+act3_failure (Failure name input want) = testCase name $ do
+  (_, r) <- spec_keypairs
+  msg1 <- unhex act1_msg
+  (msg2, r_hs) <- expect_right "act2" (BOLT8.act2 r e_r_sec msg1)
+  unhex act2_msg >>= (msg2 @?=)
+  msg3 <- unhex input
+  expect_error name want (BOLT8.finalize r_hs msg3)
+
+act2_failures :: [Failure]
+act2_failures = [
+    Failure "short read"
+      "0002466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27\
+      \6e2470b93aac583c9ef6eafca3f730"
+      BOLT8.InvalidLength
+  , Failure "bad version"
+      "0102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27\
+      \6e2470b93aac583c9ef6eafca3f730ae"
+      BOLT8.InvalidVersion
+  , Failure "bad key serialization"
+      "0004466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27\
+      \6e2470b93aac583c9ef6eafca3f730ae"
+      BOLT8.InvalidPub
+  , Failure "bad MAC"
+      "0002466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27\
+      \6e2470b93aac583c9ef6eafca3f730af"
+      BOLT8.InvalidMAC
+  ]
+
+act1_failures :: [Failure]
+act1_failures = [
+    Failure "short read"
+      "00036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7\
+      \0df6086551151f58b8afe6c195782c"
+      BOLT8.InvalidLength
+  , Failure "bad version"
+      "01036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7\
+      \0df6086551151f58b8afe6c195782c6a"
+      BOLT8.InvalidVersion
+  , Failure "bad key serialization"
+      "00046360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7\
+      \0df6086551151f58b8afe6c195782c6a"
+      BOLT8.InvalidPub
+  , Failure "bad MAC"
+      "00036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7\
+      \0df6086551151f58b8afe6c195782c6b"
+      BOLT8.InvalidMAC
+  ]
+
+act3_failures :: [Failure]
+act3_failures = [
+    Failure "bad version"
+      "01b9e3a702e93e3a9948c2ed6e5fd7590a6e1c3a0344cfc9d5b57357049aa22355\
+      \361aa02e55a8fc28fef5bd6d71ad0c38228dc68b1c466263b47fdf31e560e139ba"
+      BOLT8.InvalidVersion
+  , Failure "short read"
+      "00b9e3a702e93e3a9948c2ed6e5fd7590a6e1c3a0344cfc9d5b57357049aa22355\
+      \361aa02e55a8fc28fef5bd6d71ad0c38228dc68b1c466263b47fdf31e560e139"
+      BOLT8.InvalidLength
+  , Failure "bad MAC for ciphertext"
+      "00c9e3a702e93e3a9948c2ed6e5fd7590a6e1c3a0344cfc9d5b57357049aa22355\
+      \361aa02e55a8fc28fef5bd6d71ad0c38228dc68b1c466263b47fdf31e560e139ba"
+      BOLT8.InvalidMAC
+  , Failure "bad rs"
+      "00bfe3a702e93e3a9948c2ed6e5fd7590a6e1c3a0344cfc9d5b57357049aa22355\
+      \36ad09a8ee351870c2bb7f78b754a26c6cef79a98d25139c856d7efd252c2ae73c"
+      BOLT8.InvalidPub
+  , Failure "bad MAC"
+      "00b9e3a702e93e3a9948c2ed6e5fd7590a6e1c3a0344cfc9d5b57357049aa22355\
+      \361aa02e55a8fc28fef5bd6d71ad0c38228dc68b1c466263b47fdf31e560e139bb"
+      BOLT8.InvalidMAC
+  ]
+
+-- message encryption ---------------------------------------------------------
+
+-- Appendix A message test: "hello" sent 1001 times by the initiator
+spec_messages :: [(Int, BS.ByteString)]
+spec_messages = [
+    (0,    "cf2b30ddf0cf3f80e7c35a6e6730b59fe802473180f396d88a8fb0db8cbc\
+           \f25d2f214cf9ea1d95")
+  , (1,    "72887022101f0b6753e0c7de21657d35a4cb2a1f5cde2650528bbc8f837d\
+           \0f0d7ad833b1a256a1")
+  , (500,  "178cb9d7387190fa34db9c2d50027d21793c9bc2d40b1e14dcf30ebeeeb2\
+           \20f48364f7a4c68bf8")
+  , (501,  "1b186c57d44eb6de4c057c49940d79bb838a145cb528d6e8fd26dbe50a60\
+           \ca2c104b56b60e45bd")
+  , (1000, "4a2f3cc3b5e78ddb83dcb426d9863d9d9a723b0337c89dd0b005d89f8d3c\
+           \05c52b76b29b740f09")
+  , (1001, "2ecd8c8a5629d0d02ab457a0fdd0f7b90a192cd46be5ecb6ca570bfc5e26\
+           \8338b1a16cf4ef2d36")
+  ]
+
+-- the initiator's first n frames, each carrying "hello"
+hello_stream :: Int -> IO [BS.ByteString]
+hello_stream count = do
+  (i_res, _) <- spec_results
+  let go m s
+        | m == count = pure []
+        | otherwise = do
+            (ct, s') <- expect_right "encrypt" (BOLT8.encrypt s "hello")
+            (ct :) <$> go (m + 1) s'
+  go (0 :: Int) (BOLT8.handshake_sender i_res)
+
+message_tests :: TestTree
+message_tests = testGroup "messages" [
+    testGroup "spec vectors" (fmap spec_message spec_messages)
+  , testCase "responder decrypts the spec stream" $ do
+      (_, r_res) <- spec_results
+      frames <- hello_stream 1002
+      let go _ _ [] = pure ()
+          go m r (f : fs) = do
+            (pt, r') <- expect_right ("decrypt " <> show m) (BOLT8.decrypt r f)
+            assertEqual ("message " <> show m) "hello" pt
+            go (m + 1) r' fs
+      go (0 :: Int) (BOLT8.handshake_receiver r_res) frames
+  , testCase "reference key rotation matches spec" $ do
+      ck <- unhex final_ck
+      sk <- unhex final_sk
+      ck1 <- unhex
+        "cc2c6e467efc8067720c2d09c139d1f77731893aad1defa14f9bf3c48d3f1d31"
+      k1 <- unhex
+        "3fbdc101abd1132ca3a0ae34a669d8d9ba69a587e0bb4ddd59524541cf4813d8"
+      ck2 <- unhex
+        "728366ed68565dc17cf6dd97330a859a6a56e87e2beef3bd828a4c4a54d8df06"
+      k2 <- unhex
+        "9e0477f9850dca41e42db0e4d154e3a098e5a000d995e421849fcd5df27882bd"
+      ref_rotate ck sk >>= (@?= (ck1, k1))
+      ref_rotate ck1 k1 >>= (@?= (ck2, k2))
+  , testCase "initiator sends under sk and ck" $ do
+      (i_res, _) <- spec_results
+      ck <- unhex final_ck
+      sk <- unhex final_sk
+      check_sender ck sk (BOLT8.handshake_sender i_res)
+  , testCase "initiator receives under rk and ck" $ do
+      (i_res, _) <- spec_results
+      ck <- unhex final_ck
+      rk <- unhex final_rk
+      check_receiver ck rk (BOLT8.handshake_receiver i_res)
+  , testCase "responder sends under rk and ck" $ do
+      (_, r_res) <- spec_results
+      ck <- unhex final_ck
+      rk <- unhex final_rk
+      check_sender ck rk (BOLT8.handshake_sender r_res)
+  , testCase "responder receives under sk and ck" $ do
+      (_, r_res) <- spec_results
+      ck <- unhex final_ck
+      sk <- unhex final_sk
+      check_receiver ck sk (BOLT8.handshake_receiver r_res)
+  , testCase "initiator to responder across rotations" $ do
+      (i_res, r_res) <- spec_results
+      round_trip 1600
+        (BOLT8.handshake_sender i_res) (BOLT8.handshake_receiver r_res)
+  , testCase "responder to initiator across rotations" $ do
+      (i_res, r_res) <- spec_results
+      round_trip 1600
+        (BOLT8.handshake_sender r_res) (BOLT8.handshake_receiver i_res)
+  ]
+
+spec_message :: (Int, BS.ByteString) -> TestTree
+spec_message (m, h) = testCase ("message " <> show m) $ do
+  frames <- hello_stream 1002
+  got <- expect_just "frame" (at m frames)
+  want <- unhex h
+  got @?= want
+
+-- transport ------------------------------------------------------------------
+
+-- the spec handshake's transport states and the initiator's first two
+-- frames, carrying "hello" and "world!"
+transport_fixture
+  :: IO (BOLT8.Sender, BOLT8.Receiver, BOLT8.Receiver, BS.ByteString,
+         BS.ByteString)
+transport_fixture = do
+  (i_res, r_res) <- spec_results
+  let i_snd = BOLT8.handshake_sender i_res
+  (f0, i_snd') <- expect_right "encrypt" (BOLT8.encrypt i_snd "hello")
+  (f1, _) <- expect_right "encrypt" (BOLT8.encrypt i_snd' "world!")
+  pure ( i_snd, BOLT8.handshake_receiver i_res
+       , BOLT8.handshake_receiver r_res, f0, f1 )
+
+-- consume a buffer of frames via decrypt_header and decrypt_body
+consume
+  :: BOLT8.Receiver
+  -> BS.ByteString
+  -> Either BOLT8.Error [BS.ByteString]
+consume r buf
+  | BS.null buf = Right []
+  | otherwise = do
+      let (hdr, rest) = BS.splitAt 18 buf
+      (n, p) <- BOLT8.decrypt_header r hdr
+      let (body, rest') = BS.splitAt n rest
+      (m, r') <- BOLT8.decrypt_body p body
+      (m :) <$> consume r' rest'
+
+transport_tests :: TestTree
+transport_tests = testGroup "transport" [
+    testCase "frame is message length plus 34 bytes" $ do
+      (_, _, _, f0, f1) <- transport_fixture
+      BS.length f0 @?= 5 + 34
+      BS.length f1 @?= 6 + 34
+  , testCase "decrypt_header reports the remaining length" $ do
+      (_, _, r, f0, _) <- transport_fixture
+      (n, _) <- expect_right "header" (BOLT8.decrypt_header r (BS.take 18 f0))
+      n @?= 5 + 16
+  , testCase "header and body decrypt consecutive frames" $ do
+      (_, _, r, f0, f1) <- transport_fixture
+      ms <- expect_right "consume" (consume r (f0 <> f1))
+      ms @?= ["hello", "world!"]
+  , testCase "decrypt agrees with header and body" $ do
+      (_, _, r, f0, f1) <- transport_fixture
+      (m0, r') <- expect_right "decrypt 0" (BOLT8.decrypt r f0)
+      (m1, _) <- expect_right "decrypt 1" (BOLT8.decrypt r' f1)
+      [m0, m1] @?= ["hello", "world!"]
+  , testCase "empty message round-trips" $ do
+      (s, _, r, _, _) <- transport_fixture
+      (f, _) <- expect_right "encrypt" (BOLT8.encrypt s mempty)
+      BS.length f @?= 34
+      (m, _) <- expect_right "decrypt" (BOLT8.decrypt r f)
+      m @?= mempty
+  , testCase "65535-byte message round-trips" $ do
+      (s, _, r, _, _) <- transport_fixture
+      let big = BS.replicate 65535 0xab
+      (f, _) <- expect_right "encrypt" (BOLT8.encrypt s big)
+      BS.length f @?= 65569
+      (n, _) <- expect_right "header" (BOLT8.decrypt_header r (BS.take 18 f))
+      n @?= 65551
+      (m, _) <- expect_right "decrypt" (BOLT8.decrypt r f)
+      m @?= big
+  , testCase "encrypt rejects a 65536-byte message" $ do
+      (s, _, _, _, _) <- transport_fixture
+      expect_error "encrypt" BOLT8.InvalidLength
+        (BOLT8.encrypt s (BS.replicate 65536 0))
+  ]
+
+transport_failure_tests :: TestTree
+transport_failure_tests = testGroup "transport failures" [
+    testCase "bad length MAC" $ do
+      (_, _, r, f0, _) <- transport_fixture
+      for_bytes [2, 17] f0 $ \bad -> do
+        expect_error "decrypt" BOLT8.InvalidMAC (BOLT8.decrypt r bad)
+        expect_error "decrypt_header" BOLT8.InvalidMAC
+          (BOLT8.decrypt_header r (BS.take 18 bad))
+  , testCase "tampered length" $ do
+      (_, _, r, f0, _) <- transport_fixture
+      for_bytes [0, 1] f0 $ \bad -> do
+        expect_error "decrypt" BOLT8.InvalidMAC (BOLT8.decrypt r bad)
+        expect_error "decrypt_header" BOLT8.InvalidMAC
+          (BOLT8.decrypt_header r (BS.take 18 bad))
+  , testCase "bad body MAC" $ do
+      (_, _, r, f0, _) <- transport_fixture
+      for_bytes [18, 23, BS.length f0 - 1] f0 $ \bad -> do
+        expect_error "decrypt" BOLT8.InvalidMAC (BOLT8.decrypt r bad)
+        (n, p) <- expect_right "header"
+          (BOLT8.decrypt_header r (BS.take 18 bad))
+        expect_error "decrypt_body" BOLT8.InvalidMAC
+          (BOLT8.decrypt_body p (BS.take n (BS.drop 18 bad)))
+  , testCase "truncated frame" $ do
+      (_, _, r, f0, _) <- transport_fixture
+      let short = BS.take (BS.length f0 - 1) f0
+      expect_error "decrypt" BOLT8.InvalidLength (BOLT8.decrypt r short)
+      expect_error "decrypt, header only" BOLT8.InvalidLength
+        (BOLT8.decrypt r (BS.take 18 f0))
+      expect_error "decrypt, partial header" BOLT8.InvalidLength
+        (BOLT8.decrypt r (BS.take 17 f0))
+      expect_error "decrypt, empty" BOLT8.InvalidLength
+        (BOLT8.decrypt r mempty)
+      expect_error "decrypt_header" BOLT8.InvalidLength
+        (BOLT8.decrypt_header r (BS.take 17 f0))
+      (_, p) <- expect_right "header" (BOLT8.decrypt_header r (BS.take 18 f0))
+      expect_error "decrypt_body" BOLT8.InvalidLength
+        (BOLT8.decrypt_body p (BS.drop 18 short))
+  , testCase "trailing bytes" $ do
+      (_, _, r, f0, _) <- transport_fixture
+      let long = f0 <> "\x00"
+      expect_error "decrypt" BOLT8.InvalidLength (BOLT8.decrypt r long)
+      expect_error "decrypt_header" BOLT8.InvalidLength
+        (BOLT8.decrypt_header r (BS.take 19 f0))
+      (_, p) <- expect_right "header" (BOLT8.decrypt_header r (BS.take 18 f0))
+      expect_error "decrypt_body" BOLT8.InvalidLength
+        (BOLT8.decrypt_body p (BS.drop 18 long))
+  , testCase "replayed frame" $ do
+      (_, _, r, f0, _) <- transport_fixture
+      (_, r') <- expect_right "decrypt" (BOLT8.decrypt r f0)
+      expect_error "replay" BOLT8.InvalidMAC (BOLT8.decrypt r' f0)
+  , testCase "reordered frame" $ do
+      (_, _, r, _, f1) <- transport_fixture
+      expect_error "decrypt" BOLT8.InvalidMAC (BOLT8.decrypt r f1)
+  , testCase "reflected frame" $ do
+      (_, i_rcv, _, f0, _) <- transport_fixture
+      expect_error "decrypt" BOLT8.InvalidMAC (BOLT8.decrypt i_rcv f0)
+  ]
+  where
+    for_bytes is f act = mapM_ (\i -> flip_byte i f >>= act) is
+
+-- properties -----------------------------------------------------------------
+
+property_tests :: TestTree
+property_tests = testGroup "properties" [
+    Q.testProperty "handshake agrees on keys and statics" prop_handshake
+  , Q.testProperty "messages up to 65535 bytes round-trip" prop_size
+  , Q.testProperty "header and body recover a stream" prop_stream
+  , Q.testProperty "parse_pub inverts serialize_pub" prop_pub
+  ]
+
+-- 32 bytes that form a valid secret key
+gen_secret :: Q.Gen BS.ByteString
+gen_secret = (BS.pack <$> Q.vectorOf 32 Q.arbitrary)
+  `Q.suchThat` (isJust . BOLT8.keypair)
+
+gen_bytes :: Int -> Q.Gen BS.ByteString
+gen_bytes n = do
+  len <- Q.choose (0, n)
+  BS.pack <$> Q.vectorOf len Q.arbitrary
+
+prop_handshake :: Q.Property
+prop_handshake =
+  Q.forAll gen_secret $ \i_s ->
+  Q.forAll gen_secret $ \r_s ->
+  Q.forAll gen_secret $ \i_e ->
+  Q.forAll gen_secret $ \r_e ->
+  Q.forAll (gen_bytes 256) $ \m ->
+    case (BOLT8.keypair i_s, BOLT8.keypair r_s) of
+      (Just i, Just r) -> check i r (handshake i r i_e r_e) m
+      _ -> Q.counterexample "keypair" False
+  where
+    check _ _ (Left e) _ = Q.counterexample (show e) False
+    check i r (Right (i_res, r_res)) m =
+      let there = send (BOLT8.handshake_sender i_res)
+                       (BOLT8.handshake_receiver r_res) m
+          back  = send (BOLT8.handshake_sender r_res)
+                       (BOLT8.handshake_receiver i_res) m
+      in       BOLT8.handshake_remote_static i_res
+                 Q.=== BOLT8.keypair_pub r
+        Q..&&. BOLT8.handshake_remote_static r_res
+                 Q.=== BOLT8.keypair_pub i
+        Q..&&. there Q.=== Right m
+        Q..&&. back Q.=== Right m
+    send s r m = do
+      (ct, _) <- BOLT8.encrypt s m
+      fst <$> BOLT8.decrypt r ct
+
+prop_size :: Q.Property
+prop_size =
+  Q.forAll gen_len $ \len ->
+  Q.forAll Q.arbitrary $ \b ->
+    let m = BS.replicate len b
+    in  case spec_handshake of
+          Left e -> Q.counterexample (show e) False
+          Right (i_res, r_res) ->
+            case BOLT8.encrypt (BOLT8.handshake_sender i_res) m of
+              Left e -> Q.counterexample (show e) False
+              Right (f, _) ->
+                let r = BOLT8.handshake_receiver r_res
+                in       BS.length f Q.=== len + 34
+                  Q..&&. fmap fst (BOLT8.decrypt_header r (BS.take 18 f))
+                           Q.=== Right (len + 16)
+                  Q..&&. fmap fst (BOLT8.decrypt r f) Q.=== Right m
+  where
+    gen_len = Q.frequency [
+        (1, pure 0)
+      , (1, pure 65535)
+      , (8, Q.choose (0, 65535))
+      ]
+
+prop_stream :: Q.Property
+prop_stream =
+  Q.forAll (Q.listOf (gen_bytes 512)) $ \ms ->
+    case spec_handshake of
+      Left e -> Q.counterexample (show e) False
+      Right (i_res, r_res) ->
+        let enc _ [] = Right []
+            enc s (m : rest) = do
+              (f, s') <- BOLT8.encrypt s m
+              (f :) <$> enc s' rest
+        in  case enc (BOLT8.handshake_sender i_res) ms of
+              Left e -> Q.counterexample (show e) False
+              Right fs ->
+                consume (BOLT8.handshake_receiver r_res) (BS.concat fs)
+                  Q.=== Right ms
+
+prop_pub :: Q.Property
+prop_pub = Q.forAll gen_secret $ \sec ->
+  case BOLT8.keypair sec of
+    Nothing -> Q.counterexample "keypair" False
+    Just kp ->
+      let pub = BOLT8.keypair_pub kp
+      in  BOLT8.parse_pub (BOLT8.serialize_pub pub) Q.=== Just pub

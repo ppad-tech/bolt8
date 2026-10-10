@@ -48,14 +48,16 @@ test-suite bolt8-tests
   main-is:             Main.hs
 
   ghc-options:
-    -rtsopts -Wall -O2
+    -rtsopts -Wall
 
   build-depends:
       base
     , bytestring
+    , ppad-aead
     , ppad-base16
     , ppad-bolt8
-    , QuickCheck
+    , ppad-hkdf
+    , ppad-sha256
     , tasty
     , tasty-hunit
     , tasty-quickcheck
