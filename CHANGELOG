@@ -1,5 +1,13 @@
 # Changelog
 
+- 0.1.1 (2026-10-31)
+  * Bumps the ppad-aead and ppad-secp256k1 dependencies, to 0.3.7
+    and 0.5.9, which (along with ppad-fixed) under the llvm flag on
+    x86_64 are compiled with LLVM's x86 cmov converter off
+    (-optlc=-x86-cmov-converter=false). This library is compiled
+    likewise, as ppad-fixed's constant-time arithmetic can be inlined
+    into it.
+
 - 0.1.0 (2026-10-10)
   * Breaking: splits the post-handshake session into separate Sender
     and Receiver states, so one state can't serve both directions and
